@@ -74,5 +74,75 @@ verify() {
         say "showrepl reports failures on a fresh provision"; rc=1
     fi
 
+    # --- adversarial-profile checks --------------------------------------------
+    # These all assert behaviors that are hard to test with cooperative
+    # inputs (alpha-only realm, short ASCII NetBIOS) but become
+    # load-bearing under --profile adversarial. Each check
+    # self-activates from the input shape — no need to gate on
+    # $PROFILE_NAME — so they pass cheaply under the default profile and
+    # add real coverage under adversarial.
+
+    # Hyphen preservation. Triggers when SC_REALM contains '-'. The
+    # provisioned realm, BASE_DN, krb5.conf default_realm, and SYSVOL
+    # path must all preserve the hyphen exactly. Catches any
+    # accidental ${realm//[-.]/_} or tr '-' '_' that "tidies up" the
+    # realm somewhere in the pipeline.
+    if [[ "$SC_REALM" == *-* ]]; then
+        say "adversarial: hyphen in realm '${SC_REALM}' is preserved end-to-end"
+
+        local realm_lc; realm_lc=$(echo "$SC_REALM" | tr '[:upper:]' '[:lower:]')
+        local base_dn; base_dn="DC=${realm_lc//./,DC=}"
+
+        # smb.conf realm: literal preservation.
+        ssh_vm "sudo grep -qE \"^[[:space:]]*realm[[:space:]]*=[[:space:]]*${SC_REALM}[[:space:]]*$\" /etc/samba/smb.conf" \
+            || { say "  smb.conf realm does NOT match ${SC_REALM} verbatim"; rc=1; }
+
+        # krb5.conf default_realm: literal preservation (case-insensitive
+        # match because Samba/MIT toolchains differ on realm case).
+        out=$(ssh_vm 'sudo grep -E "default_realm" /etc/krb5.conf' 2>&1 || true)
+        echo "  krb5: $out"
+        grep -qiF "$SC_REALM" <<< "$out" || { say "  krb5.conf default_realm does NOT contain ${SC_REALM}"; rc=1; }
+
+        # SYSVOL path: hyphen preserved in the directory name.
+        ssh_vm "sudo test -d /var/lib/samba/sysvol/${realm_lc}/Policies" \
+            || { say "  SYSVOL Policies dir not at /var/lib/samba/sysvol/${realm_lc}/Policies"; rc=1; }
+
+        # samba-tool reports BASE_DN with the hyphen intact.
+        out=$(ssh_vm 'sudo samba-tool domain info 127.0.0.1 2>&1' || true)
+        echo "$out" | head -10
+        grep -qiF "$base_dn" <<< "$out" || { say "  domain info BASE_DN does NOT contain ${base_dn}"; rc=1; }
+    fi
+
+    # NetBIOS length boundary. Triggers when SC_NETBIOS is exactly 15
+    # chars (the maximum allowed visible length). The provisioned
+    # workgroup must be the full 15 chars, not truncated to 14 or
+    # padded to 16.
+    if [[ ${#SC_NETBIOS} -eq 15 ]]; then
+        say "adversarial: 15-char NetBIOS '${SC_NETBIOS}' is preserved (no truncation)"
+        out=$(ssh_vm "sudo grep -E '^\\s*workgroup' /etc/samba/smb.conf" 2>&1 || true)
+        echo "  workgroup line: $out"
+        local got_wg
+        got_wg=$(grep -oE 'workgroup[[:space:]]*=[[:space:]]*[^[:space:]]+' <<< "$out" | awk -F= '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2}')
+        if [[ "$got_wg" != "$SC_NETBIOS" ]]; then
+            say "  workgroup is '${got_wg}' (length ${#got_wg}), expected '${SC_NETBIOS}' (length 15) — truncation or transform happened"; rc=1
+        fi
+    fi
+
+    # Password-quoting trap. When SC_PASS contains shell-hazardous chars
+    # ($, ", `, \, '), the kinit assertion above (line ~50) becomes the
+    # load-bearing test: if provisioning AND kinit both succeeded with a
+    # hazardous password, every shell layer in the pipeline (samba-tool
+    # provision invocation, kinit pipe, whiptail prompts when run
+    # interactively) handled the chars correctly. Just announce here so
+    # the scenario log explains why this was a meaningful run, and flag
+    # if any *other* check above failed — the failure was almost
+    # certainly the password chain, not the test it surfaced in.
+    if [[ "$SC_PASS" == *\"* || "$SC_PASS" == *\$* || "$SC_PASS" == *\`* || "$SC_PASS" == *\\* || "$SC_PASS" == *\'* ]]; then
+        say "adversarial: hazardous-char password survived end-to-end (provision + kinit above)"
+        if [[ $rc -ne 0 ]]; then
+            say "  NB: a check above failed under hazardous-char password — the password pipeline is the most likely cause"
+        fi
+    fi
+
     return $rc
 }

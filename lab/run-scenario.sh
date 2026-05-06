@@ -41,6 +41,10 @@ Flags forwarded to lab-kit runner:
 Samba-specific flags (consumed by scenario pre_hooks):
   --no-cleanup    set SC_SKIP_CLEANUP=1 (skip WS2025 AD cleanup)
   --dry-cleanup   set SC_DRY_CLEANUP=1 (inspect only)
+  --profile NAME  source lab/profiles/NAME.env after env setup; lets
+                  a scenario run with a swapped set of trap inputs
+                  (hyphenated realm, edge-case NetBIOS, password with
+                  special chars). Available profiles: see lab/profiles/.
 
 Scenarios in $SCRIPT_DIR/scenarios:
 USAGE
@@ -58,6 +62,7 @@ fi
 
 SCENARIO=""
 FORWARD=()
+PROFILE_NAME=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,6 +77,8 @@ while [[ $# -gt 0 ]]; do
             export SC_SKIP_CLEANUP=1 ;;
         --dry-cleanup)
             export SC_DRY_CLEANUP=1 ;;
+        --profile)
+            PROFILE_NAME="$2"; shift ;;
         -*)
             echo "Unknown flag: $1" >&2; usage >&2; exit 2 ;;
         *)
@@ -85,6 +92,22 @@ done
 
 SCENARIO_FILE="$SCRIPT_DIR/scenarios/$SCENARIO.sh"
 [[ -f "$SCENARIO_FILE" ]] || { echo "No such scenario: $SCENARIO_FILE" >&2; exit 2; }
+
+# Source the named profile if --profile was given. Profiles use
+# `export SC_X=...` so all overrides reach the lab-kit runner and
+# the scenario.
+if [[ -n "$PROFILE_NAME" ]]; then
+    PROFILE_FILE="$SCRIPT_DIR/profiles/$PROFILE_NAME.env"
+    if [[ ! -f "$PROFILE_FILE" ]]; then
+        echo "ERROR: no such profile: $PROFILE_FILE" >&2
+        echo "Available profiles:" >&2
+        find "$SCRIPT_DIR/profiles" -maxdepth 1 -name '*.env' -type f 2>/dev/null \
+            | sed 's|.*/||; s|\.env$||; s|^|  |' | sort >&2
+        exit 2
+    fi
+    # shellcheck disable=SC1090
+    source "$PROFILE_FILE"
+fi
 
 # cd to repo root so LAB_STAGE_SOURCES and LAB_PUSH_FILES globs in samba.env
 # resolve against the expected layout.
