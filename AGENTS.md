@@ -111,6 +111,12 @@ Use `--verify-only` for fast assertion iteration against current VM state:
 lab/run-scenario.sh join-dc --verify-only
 ```
 
+## Checks
+
+```bash
+bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
+```
+
 ## Development Rules
 
 - Prefer small, reviewable changes.
