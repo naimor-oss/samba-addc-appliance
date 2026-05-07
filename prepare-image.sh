@@ -1127,11 +1127,18 @@ if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
 elif apt-get update -qq >>"$LOGFILE" 2>&1; then
     upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
-    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security')
+    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security' || true)
     if [[ "$upg" -eq 0 ]]; then
         APT_FRESHNESS="apt: image is current (0 upgrades pending)"
     else
-        APT_FRESHNESS="apt: ${upg} upgrades pending (${sec} security-marked); review with 'apt list --upgradable', apply with 'sudo apt-get upgrade'"
+        # Kernel and other held-back packages require dist-upgrade (installs new
+        # packages); plain upgrade refuses to do so and silently skips them.
+        if apt-get --simulate upgrade 2>/dev/null | grep -q "kept back"; then
+            apt_cmd="sudo apt-get dist-upgrade"
+        else
+            apt_cmd="sudo apt-get upgrade"
+        fi
+        APT_FRESHNESS="apt: ${upg} upgrades pending (${sec} security-marked); review with 'apt list --upgradable', apply with '${apt_cmd}'"
     fi
 else
     APT_FRESHNESS="apt: index refresh failed — see $LOGFILE"
@@ -1260,7 +1267,8 @@ cat > /etc/systemd/system/samba-firstboot.service <<'UEOF'
 [Unit]
 Description=Samba AD DC Appliance first-boot host integration
 ConditionPathExists=!/var/lib/samba-firstboot.done
-After=local-fs.target
+After=local-fs.target network-online.target
+Wants=network-online.target
 # Run before samba-ad-dc so the guest agent is up before any AD traffic.
 # samba-ad-dc is masked at image-prep time and only enabled by samba-sconfig
 # after a join/provision, so this ordering is mostly defensive.
