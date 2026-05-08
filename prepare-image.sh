@@ -1514,6 +1514,18 @@ cat > /usr/local/sbin/samba-init <<'INITEOF'
 
 set -u
 
+# Source shared appliance-core libs vendored by prepare-image.sh §18b.
+# Sentinel-guarded so this is a no-op if already loaded by an earlier
+# script in the same shell; falls through silently when the libs are
+# absent (older images that predate the vendoring).
+APPCORE_LIBS=/usr/local/lib/appliance-core
+if [[ -d "$APPCORE_LIBS" ]]; then
+    for _lib in apt-helpers detect-net identity tui hostname; do
+        [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
+    done
+    unset _lib
+fi
+
 MARKER=/var/lib/samba-init.done
 DEFAULT_PWD_MARKER=/var/lib/samba-init-default-password
 GETTY_DROPIN=/etc/systemd/system/getty@tty1.service.d/samba-init.conf
@@ -1596,19 +1608,16 @@ load_detect_env() {
 }
 
 count_upgrades() {
+    # Delegate to appliance-core when vendored; the lib's
+    # implementation is the canonical phased-rollout-aware counter.
+    # Fallback retained for older images that predate vendoring.
+    if command -v appcore_apt_count_upgrades >/dev/null 2>&1; then
+        appcore_apt_count_upgrades
+        return
+    fi
     if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
         echo "0 0"; return
     fi
-    # `apt list --upgradable` includes packages caught in a phased
-    # rollout (apt 2.x feature: a percentage of machines are held back
-    # until the rollout completes). After a successful full-upgrade,
-    # phased packages stay on the upgradable list permanently from this
-    # machine's perspective, so the operator sees a stale "N pending"
-    # banner that never clears no matter how many times they upgrade.
-    #
-    # `apt-get --simulate dist-upgrade` reports what apt would actually
-    # install RIGHT NOW — phased packages and other held-back items are
-    # excluded. That's the count the operator can act on.
     local sim upg sec
     sim=$(apt-get --simulate -qq dist-upgrade 2>/dev/null) || sim=""
     upg=$(grep -c '^Inst ' <<< "$sim" || true)
@@ -1880,13 +1889,25 @@ action_update() {
     echo "      Debian metapackages like linux-image-cloud-amd64 only"
     echo "      pick up new kernel ABIs through full-upgrade."
     echo
-    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
+        sudo DEBIAN_FRONTEND=noninteractive bash -c \
+            'source /usr/local/lib/appliance-core/apt-helpers.sh; appcore_apt_run_full_upgrade'
+    else
+        # Fallback for older images.
+        sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    fi
     echo
     echo "=============================================================="
-    if [[ -f /var/run/reboot-required ]]; then
-        echo "  REBOOT REQUIRED — a kernel or library that's currently"
-        echo "  loaded was upgraded. Pick [R] from the menu (or run"
-        echo "  'sudo reboot') to apply the new version."
+    local rb=""
+    if command -v appcore_apt_reboot_banner_line >/dev/null 2>&1; then
+        rb=$(appcore_apt_reboot_banner_line)
+    elif [[ -f /var/run/reboot-required ]]; then
+        rb="REBOOT REQUIRED"
+    fi
+    if [[ -n "$rb" ]]; then
+        echo "  $rb"
+        echo "  A kernel or library that's currently loaded was upgraded."
+        echo "  Pick [R] from the menu (or run 'sudo reboot') to apply."
     else
         echo "  Done. No reboot required."
     fi

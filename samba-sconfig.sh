@@ -562,21 +562,29 @@ EOF
 run_updates_now() {
     if yesno "Run apt update && apt full-upgrade now?\n\nFull-upgrade is required to apply kernel metapackage updates\n(linux-image-cloud-amd64) — plain 'apt upgrade' silently keeps\nthem back. Runs interactively so you can review."; then
         clear
-        echo "[sconfig] apt update..."
-        apt-get update
-        echo
         echo "[sconfig] apt full-upgrade..."
         echo "[sconfig]   note: full-upgrade can install new dependencies"
         echo "[sconfig]   (e.g. new kernel ABI). Plain 'apt-get upgrade'"
         echo "[sconfig]   would silently keep them back."
         echo
-        apt-get full-upgrade
+        if command -v appcore_apt_run_full_upgrade >/dev/null 2>&1; then
+            appcore_apt_run_full_upgrade
+        else
+            apt-get update && apt-get full-upgrade
+        fi
         echo
         echo "=============================================================="
-        if [[ -f /var/run/reboot-required ]]; then
-            echo "  REBOOT REQUIRED — a kernel or library that's currently"
-            echo "  loaded was upgraded. Pick 'Reboot / Shutdown' from the"
-            echo "  main menu (or run 'sudo reboot') to apply."
+        local rb=""
+        if command -v appcore_apt_reboot_banner_line >/dev/null 2>&1; then
+            rb=$(appcore_apt_reboot_banner_line)
+        elif [[ -f /var/run/reboot-required ]]; then
+            rb="REBOOT REQUIRED"
+        fi
+        if [[ -n "$rb" ]]; then
+            echo "  $rb"
+            echo "  A kernel or library that's currently loaded was upgraded."
+            echo "  Pick 'Reboot / Shutdown' from the main menu (or run"
+            echo "  'sudo reboot') to apply."
         else
             echo "  Done. No reboot required."
         fi
