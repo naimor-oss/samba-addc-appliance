@@ -1520,7 +1520,7 @@ set -u
 # absent (older images that predate the vendoring).
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    for _lib in apt-helpers detect-net identity tui hostname; do
+    for _lib in apt-helpers detect-net identity tui hostname netconfig; do
         [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
     done
     unset _lib
@@ -1656,70 +1656,24 @@ show_status() {
 }
 
 config_network() {
-    load_detect_env
-    local mode
-    mode=$(whiptail --title "Network configuration" \
-        --menu "Pick a mode.\n\nDHCP uses whatever the network gives. Static converts to fixed values; defaults are pre-filled from the current DHCP lease when available." \
-        16 "$WT_WIDTH" 2 \
-        "dhcp"   "DHCP (default for cloud / lab environments)" \
-        "static" "Static IPv4 (pre-filled from the current lease, if any)" \
-        3>&1 1>&2 2>&3) || return
-
-    case "$mode" in
-        dhcp)
-            sudo bash -c 'cat > /etc/netplan/60-samba-init.yaml <<NPY
-network:
-  version: 2
-  ethernets:
-    primary:
-      match:
-        name: "e*"
-      dhcp4: true
-      dhcp6: false
-NPY
-chmod 600 /etc/netplan/60-samba-init.yaml'
-            ;;
-        static)
-            local ipcidr_default gateway_default dns_default prefix
-            prefix=$(ip -o -4 addr show scope global 2>/dev/null \
-                        | awk 'NR==1 {split($4,a,"/"); print a[2]}')
-            ipcidr_default=""
-            [[ -n "$DET_IP" ]] && ipcidr_default="${DET_IP}/${prefix:-24}"
-            gateway_default="${DET_GATEWAY}"
-            dns_default="${DET_DHCP_DNS:-1.1.1.1}"
-
-            local ipcidr gateway dns
-            ipcidr=$(whiptail --inputbox "IPv4 address with CIDR (e.g. 10.0.0.20/24):" 10 "$WT_WIDTH" "$ipcidr_default" 3>&1 1>&2 2>&3) || return
-            gateway=$(whiptail --inputbox "Default gateway:" 10 "$WT_WIDTH" "$gateway_default" 3>&1 1>&2 2>&3) || return
-            dns=$(whiptail --inputbox "DNS server(s), space-separated:" 10 "$WT_WIDTH" "$dns_default" 3>&1 1>&2 2>&3) || return
-            local nslist=""
-            for n in $dns; do nslist+="$n, "; done
-            nslist="${nslist%, }"
-            sudo bash -c "cat > /etc/netplan/60-samba-init.yaml <<NPY
-network:
-  version: 2
-  ethernets:
-    primary:
-      match:
-        name: \"e*\"
-      dhcp4: false
-      addresses: [${ipcidr}]
-      routes:
-        - to: default
-          via: ${gateway}
-      nameservers:
-        addresses: [${nslist}]
-NPY
-chmod 600 /etc/netplan/60-samba-init.yaml"
-            ;;
-    esac
-    if sudo netplan apply 2>&1 | tee /tmp/netplan.$$; then
-        whiptail --title "Network applied" --scrolltext --msgbox \
-            "$(cat /tmp/netplan.$$)\n\nResult:\n$(ip -br addr show)" 18 "$WT_WIDTH"
-    else
-        whiptail --msgbox "netplan apply reported errors. See /tmp/netplan.$$ — fix and retry." 10 "$WT_WIDTH"
+    # Delegate to appliance-core's netconfig.sh. The lib's
+    # change_tui_single_nic offers DHCP / pin-current-lease /
+    # custom-static / cancel, validates inputs via identity.sh,
+    # writes proper netplan, applies, and shows the result via the
+    # sized-textbox renderer (no clipping on long output).
+    if command -v appcore_netconfig_change_tui_single_nic >/dev/null 2>&1; then
+        sudo bash -c '
+            source /usr/local/lib/appliance-core/netconfig.sh
+            appcore_netconfig_change_tui_single_nic \
+                /etc/netplan/60-samba-init.yaml \
+                "e*"
+        '
+        return
     fi
-    rm -f /tmp/netplan.$$
+    # Fallback for older images without the lib.
+    whiptail --title "Network configuration" --msgbox \
+        "appliance-core netconfig lib missing.\nRebuild via lab/build-fresh-base.sh." \
+        10 60
 }
 
 change_password() {

@@ -37,10 +37,11 @@ readonly WT_MENU_HEIGHT=14
 # the sconfig still works for paths that don't depend on them.
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    [[ -f "$APPCORE_LIBS/identity.sh" ]] && source "$APPCORE_LIBS/identity.sh"
-    [[ -f "$APPCORE_LIBS/tui.sh"      ]] && source "$APPCORE_LIBS/tui.sh"
-    [[ -f "$APPCORE_LIBS/hostname.sh" ]] && source "$APPCORE_LIBS/hostname.sh"
+    [[ -f "$APPCORE_LIBS/identity.sh"   ]] && source "$APPCORE_LIBS/identity.sh"
+    [[ -f "$APPCORE_LIBS/tui.sh"        ]] && source "$APPCORE_LIBS/tui.sh"
+    [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
+    [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
 fi
 
 die()  { whiptail --msgbox "FATAL: $*" 10 60; exit 1; }
@@ -372,84 +373,19 @@ get_current_dns() {
 }
 
 config_network() {
-    local iface
-    iface=$(get_iface)
-    [[ -z "$iface" ]] && { info "ERROR: No network interface detected."; return; }
-
-    local current_ip current_mask current_gw current_dns addr_source
-    current_ip=$(get_ip | cut -d/ -f1)
-    current_mask=$(get_ip | cut -d/ -f2)
-    current_gw=$(get_gateway)
-    current_dns=$(get_current_dns)
-    addr_source=$(get_addr_source "$iface")
-
-    # If the host is currently on DHCP (typical first-boot state on lab-v2),
-    # offer the one-shot "pin the current lease as static" path as the most
-    # common path. An AD DC needs a stable IP; the lab's dnsmasq reservation
-    # keeps the lease stable, but static is the real-world expectation.
-    local mode
-    if [[ "$addr_source" == "dhcp" ]]; then
-        mode=$(whiptail --title "Network Configuration" \
-            --menu "Interface $iface is currently on DHCP.\n\nCurrent lease:\n  IP:  $current_ip/$current_mask\n  GW:  $current_gw\n  DNS: $current_dns\n\nAn AD DC needs a stable IP. Choose one:" \
-            $WT_HEIGHT $WT_WIDTH 6 \
-            "1" "Pin current DHCP lease as static (recommended)" \
-            "2" "Enter different static IP" \
-            "3" "Keep DHCP (not recommended for a DC)" \
-            "B" "Back" \
-            3>&1 1>&2 2>&3) || return
-    else
-        mode='2'   # already static (or none) — go straight to manual entry
+    # Delegate to appliance-core's netconfig.sh. Replaces a previously-
+    # broken inline implementation that wrote /etc/network/interfaces
+    # — Debian 13 with systemd-networkd + netplan silently ignores
+    # that file, so operator clicks here had no effect on real
+    # network state. The lib emits real netplan that the kernel's
+    # network stack actually honors.
+    if ! command -v appcore_netconfig_change_tui_single_nic >/dev/null 2>&1; then
+        info "appliance-core netconfig lib not vendored on this image.\nRebuild via lab/build-fresh-base.sh, or copy ../appliance-core/lib/netconfig.sh\nto /usr/local/lib/appliance-core/ by hand."
+        return
     fi
-
-    local new_ip new_mask new_gw new_dns
-    case "$mode" in
-        1)
-            new_ip="$current_ip"
-            new_mask="${current_mask:-24}"
-            new_gw="$current_gw"
-            new_dns="${current_dns:-1.1.1.1}"
-            yesno "Pin as static?\n\nInterface: $iface\nIP: $new_ip/$new_mask\nGateway: $new_gw\nDNS: $new_dns" || return
-            ;;
-        2)
-            new_ip=$(whiptail --inputbox "Interface: $iface\n\nStatic IP address:" \
-                10 60 "$current_ip" 3>&1 1>&2 2>&3) || return
-            new_mask=$(whiptail --inputbox "Subnet prefix length (e.g., 24):" \
-                10 60 "${current_mask:-24}" 3>&1 1>&2 2>&3) || return
-            new_gw=$(whiptail --inputbox "Default gateway:" \
-                10 60 "$current_gw" 3>&1 1>&2 2>&3) || return
-            new_dns=$(whiptail --inputbox "Upstream DNS (used pre-domain; post-domain sconfig points at 127.0.0.1):" \
-                10 64 "${current_dns:-1.1.1.1}" 3>&1 1>&2 2>&3) || return
-            yesno "Apply static?\n\nInterface: $iface\nIP: $new_ip/$new_mask\nGateway: $new_gw\nDNS: $new_dns" || return
-            ;;
-        3)
-            info "Keeping DHCP. Make sure router has a reservation for this host."
-            return
-            ;;
-        *)  return ;;
-    esac
-
-    cat > /etc/network/interfaces << NETEOF
-# Managed by samba-sconfig
-auto lo
-iface lo inet loopback
-
-auto ${iface}
-iface ${iface} inet static
-    address ${new_ip}/${new_mask}
-    gateway ${new_gw}
-NETEOF
-
-    take_over_resolv_conf
-    cat > /etc/resolv.conf << DNSEOF
-nameserver ${new_dns}
-DNSEOF
-
-    local fqdn short
-    fqdn=$(get_fqdn); short=$(get_hostname)
-    sed -i "/[[:space:]]${fqdn}\b/d" /etc/hosts 2>/dev/null || true
-    echo "${new_ip}  ${fqdn}  ${short}" >> /etc/hosts
-
-    info "Network written to /etc/network/interfaces.\nReboot (or 'systemctl restart networking') to apply."
+    appcore_netconfig_change_tui_single_nic \
+        /etc/netplan/60-samba-init.yaml \
+        'e*'
 }
 
 config_timezone() { dpkg-reconfigure tzdata; }
