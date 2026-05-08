@@ -887,6 +887,135 @@ SYNCEOF
 chmod +x /usr/local/sbin/sysvol-sync
 
 #===============================================================================
+# 21b. DFS-N TARGET-LIST PARSER
+#===============================================================================
+# msDFS-TargetListv2 is a UTF-16LE-encoded XML document (Windows Server
+# 2008+ namespace metadata format), NOT a packed binary blob as the
+# MS-DFSNM v1 spec might suggest. Confirmed by inspecting a live blob
+# from a WS2025 forest — see docs/DFS-N.md for the truth check.
+#
+# samba-sconfig dfs-update calls this helper to convert one base64 blob
+# (read on stdin) into one tab-separated record per line on stdout:
+#
+#   <priorityClass>\t<priorityRank>\t<state>\t<unc>
+#
+# Stdlib only — no extra packages.
+#
+# Exit codes:
+#   0  parsed ≥1 target
+#   2  parsed cleanly but found no targets (caller may treat as "skip")
+#   3  blob decode or XML parse failure (caller should refuse to apply)
+log "Installing samba-dfs-parse-targets..."
+cat > /usr/local/sbin/samba-dfs-parse-targets <<'PARSEEOF'
+#!/usr/bin/env python3
+r"""
+samba-dfs-parse-targets — parse a msDFS-TargetListv2 XML blob.
+
+Reads base64 on stdin, writes one TSV record per target on stdout:
+    priorityClass  priorityRank  state  unc
+
+Stdlib only. The blob is a UTF-16LE XML document (with optional BOM)
+shaped like:
+
+    <?xml version="1.0" encoding="utf-16"?>
+    <targets majorVersion="2" minorVersion="0" targetCount="N"
+             xmlns="http://schemas.microsoft.com/dfs/2007/03">
+      <target state="online" priorityClass="siteCostNormal"
+              priorityRank="0">\\SERVER\share</target>
+      ...
+    </targets>
+"""
+
+import base64
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+
+def main() -> int:
+    raw = sys.stdin.read().strip()
+    if not raw:
+        print("samba-dfs-parse-targets: empty stdin", file=sys.stderr)
+        return 3
+    try:
+        blob = base64.b64decode(raw, validate=False)
+    except Exception as exc:
+        print(f"samba-dfs-parse-targets: base64 decode failed: {exc}",
+              file=sys.stderr)
+        return 3
+    # Strip UTF-16 BOM if present and pick the right endianness. The
+    # default-without-BOM is little-endian per the XML PI's encoding=
+    # attribute and matches what WS2025 emits in practice.
+    if blob[:2] == b"\xff\xfe":
+        endian = "utf-16-le"
+        blob = blob[2:]
+    elif blob[:2] == b"\xfe\xff":
+        endian = "utf-16-be"
+        blob = blob[2:]
+    else:
+        endian = "utf-16-le"
+    try:
+        text = blob.decode(endian)
+    except UnicodeDecodeError as exc:
+        print(f"samba-dfs-parse-targets: {endian} decode failed: {exc}",
+              file=sys.stderr)
+        return 3
+
+    # ElementTree handles namespaces but it's painful to work with element
+    # tag names that include the URI. Strip the default xmlns once so we
+    # can use plain tag names below. The blob is internal AD metadata, not
+    # untrusted XML from the network — no XXE or external-entity surface.
+    text = re.sub(r'\sxmlns="[^"]+"', "", text, count=1)
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        print(f"samba-dfs-parse-targets: XML parse failed: {exc}",
+              file=sys.stderr)
+        return 3
+
+    if root.tag != "targets":
+        print(f"samba-dfs-parse-targets: unexpected root tag {root.tag!r}",
+              file=sys.stderr)
+        return 3
+
+    out_lines = []
+    for t in root.findall("target"):
+        unc = (t.text or "").strip()
+        if not unc:
+            continue
+        pclass = t.get("priorityClass", "siteCostNormal")
+        prank = t.get("priorityRank", "0")
+        state = t.get("state", "online")
+        out_lines.append(f"{pclass}\t{prank}\t{state}\t{unc}")
+
+    if not out_lines:
+        return 2
+    for line in out_lines:
+        print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PARSEEOF
+chmod 0755 /usr/local/sbin/samba-dfs-parse-targets
+
+# Self-test against a real WS2025-generated blob captured during lab
+# validation. Single target, siteCostNormal class, online. Treat any
+# failure as a hard image-prep error.
+if ! out=$(printf '%s' '//48AD8AeABtAGwAIAB2AGUAcgBzAGkAbwBuAD0AIgAxAC4AMAAiACAAZQBuAGMAbwBkAGkAbgBnAD0AIgB1AHQAZgAtADEANgAiAD8APgANAAoAPAB0AGEAcgBnAGUAdABzACAAbQBhAGoAbwByAFYAZQByAHMAaQBvAG4APQAiADIAIgAgAG0AaQBuAG8AcgBWAGUAcgBzAGkAbwBuAD0AIgAwACIAIAB0AGEAcgBnAGUAdABDAG8AdQBuAHQAPQAiADEAIgAgAHQAbwB0AGEAbABTAHQAcgBpAG4AZwBMAGUAbgBnAHQAaABJAG4AQgB5AHQAZQBzAD0AIgA0ADIAIgAgAHgAbQBsAG4AcwA9ACIAaAB0AHQAcAA6AC8ALwBzAGMAaABlAG0AYQBzAC4AbQBpAGMAcgBvAHMAbwBmAHQALgBjAG8AbQAvAGQAZgBzAC8AMgAwADAANwAvADAAMwAiAD4ADQAKACAAIAA8AHQAYQByAGcAZQB0ACAAcwB0AGEAdABlAD0AIgBvAG4AbABpAG4AZQAiACAAcAByAGkAbwByAGkAdAB5AEMAbABhAHMAcwA9ACIAcwBpAHQAZQBDAG8AcwB0AE4AbwByAG0AYQBsACIAIABwAHIAaQBvAHIAaQB0AHkAUgBhAG4AawA9ACIAMAAiAD4AXABcAFcASQBOAC0AUABSAEkATQBBAFIAWQBcAFAAdQBiAGwAaQBjADwALwB0AGEAcgBnAGUAdAA+AA0ACgA8AC8AdABhAHIAZwBlAHQAcwA+AA==' \
+        | /usr/local/sbin/samba-dfs-parse-targets); then
+    err "samba-dfs-parse-targets self-test failed (rc=$?)"; exit 1
+fi
+expected=$'siteCostNormal\t0\tonline\t\\\\WIN-PRIMARY\\Public'
+if [[ "$out" != "$expected" ]]; then
+    err "samba-dfs-parse-targets self-test mismatch:\n  got: $out\n  want: $expected"
+    exit 1
+fi
+log "  samba-dfs-parse-targets self-test passed"
+
+#===============================================================================
 # 22. FIRST-BOOT HOST INTEGRATION
 #===============================================================================
 # samba-firstboot detects which hypervisor we're running on AT FIRST BOOT

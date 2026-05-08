@@ -67,6 +67,63 @@ Iterate only on verification:
 lab/run-scenario.sh join-dc --verify-only
 ```
 
+### `dfs-namespace`
+
+Purpose: prove the Samba DC can serve as a tertiary domain-based DFS-N
+namespace target — read AD-replicated link metadata, validate it against
+adversarial input, materialize MSDFS symlinks, and refuse to prune in
+unsafe states. Background and design in [`DFS-N.md`](DFS-N.md).
+
+What it covers:
+
+- `samba-sconfig dfs-init` writes a `conf.d` drop-in (read-only namespace
+  share, msdfs root) and the global sentinel.
+- `samba-sconfig dfs-configure` records namespaces and the prefer-regex.
+- `samba-sconfig dfs-update` parses `msDFS-TargetListv2` blobs via the
+  `samba-dfs-parse-targets` Python helper, validates each
+  `msDFS-LinkPathv2` and target UNC, applies prefer-list ordering, and
+  atomically writes msdfs symlinks under the namespace root.
+- Adversarial inputs covered by the namespace setup: spaces+parens
+  (`Quarterly Reports (FY26)`), dollar (`IT$Tools`), single-word
+  (`one`). A deliberately malformed `..\..\evil` link is also
+  attempted via raw LDAP; AD's schema rejects the minimum-attribute
+  object before our validator runs, so the on-disk check passes
+  trivially. The path-validator and UNC-validator surfaces are
+  exercised end-to-end against 22 adversarial inputs by a local
+  unit harness during dev — see `docs/DFS-N.md` §11.
+- Convergence: after the initial sync, the scenario adds a new
+  folder on WS2025-DC1 and removes an existing one, then re-runs
+  `dfs-update`. The new symlink must appear, the removed one must
+  prune, and the rest must stay intact. This is the timer's reason
+  for existing — without it the static state can't tell "wrote the
+  right thing once" from "actually adapts to changes."
+- Sentinel guard: removing `.dfsn-managed` makes the next update
+  return rc=2 without filesystem changes.
+- Empty-result guard: pointing at a non-existent namespace must not
+  prune existing links.
+- Schedule path installs and starts the systemd timer.
+
+Run:
+
+```bash
+lab/run-scenario.sh dfs-namespace
+```
+
+Lab-side prerequisites:
+
+- `Setup-DfsnTestNamespace.ps1` — creates the namespace and the four
+  test folders.
+- `Modify-DfsnTestNamespace.ps1` — drives the convergence step
+  (add `NewFolder`, remove `one`).
+- `Reset-DfsnTestNamespace.ps1` — idempotent teardown for re-runs.
+
+All three are staged automatically by the runner. The scenario does
+**not** register the Samba DC as a namespace root target — that
+requires the appliance to already be joined and serving the share,
+and `New-DfsnRootTarget` validates target reachability. Tertiary-
+priority registration is a deployment-time concern, not part of the
+test surface.
+
 ## Important Tests To Add
 
 The following tests are the highest-value next additions. They are written in

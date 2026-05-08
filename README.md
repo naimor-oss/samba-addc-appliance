@@ -39,7 +39,7 @@ expectations, DNS, and SYSVOL handling.
 | `lab/` | Samba test harness: runner, env, scenarios, and Hyper-V helpers under `lab/hyperv/`. Generic pieces (revert, router) live in the sibling repos. |
 | `lab/hyperv/` | Hyper-V/WS2025-specific PowerShell + unattend XML: WS2025 DC build, baseline apply, Samba test VM creation, AD cleanup, verification. |
 | `lab/run-scenario.sh` | Mac-side test runner that reverts the Samba VM, cleans the Windows lab state, pushes current scripts, runs a scenario, and verifies results. Stages PS scripts from this repo plus `../lab-kit/hypervisors/hyperv/` and `../lab-router/hypervisors/hyperv/`. |
-| `lab/scenarios/` | Scenario definitions. `join-dc.sh` is the current end-to-end additional-DC test. |
+| `lab/scenarios/` | Scenario definitions. `join-dc.sh` is the current end-to-end additional-DC test; `dfs-namespace.sh` exercises DFS-N tertiary-target behavior end-to-end with adversarial folder names. |
 | `test-results/` | Distilled historical notes, topology, and regression reports. Raw `*.log` transcripts are local-only. |
 | `docs/SETUP.md` | From-scratch development + test environment setup. Read this first. |
 | `docs/LAB-TESTING.md` | Scenario runner model, existing + planned scenarios, useful assertions. |
@@ -286,6 +286,17 @@ caveat live in [`docs/RELEASE.md`](docs/RELEASE.md).
 
 - Samba does not implement DFSR. SYSVOL replication is handled explicitly by
   `sysvol-sync` and by SMB-based seeding after a Windows join.
+- DFS-N (domain-based namespaces) is supported as a tertiary fallback
+  target via `samba-sconfig dfs-*` (interactive TUI under main-menu
+  item *DFS Namespace Server*, or headless subcommands for
+  automation). The appliance reads the AD-replicated link metadata,
+  parses the UTF-16LE-XML `msDFS-TargetListv2` blobs, and atomically
+  materializes MSDFS symlinks under a hosted namespace share. Tertiary
+  status is set on the Windows side (`New-DfsnRootTarget` to register,
+  then `Set-DfsnRootTarget -ReferralPriorityClass GlobalLow`) —
+  symlink ordering is only a within-referral hint. Design,
+  AD-storage truth checks, and adversarial-input rules:
+  [`docs/DFS-N.md`](docs/DFS-N.md).
 - Samba's default AD DC functional level can be too low for modern Windows
   forests. `samba-sconfig` probes rootDSE and passes the matching functional
   level to `samba-tool domain join`.

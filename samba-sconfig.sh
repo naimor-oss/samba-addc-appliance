@@ -251,10 +251,11 @@ main_menu() {
             "2" "Domain Operations" \
             "3" "Post-Domain Setup" \
             "4" "SYSVOL Replication" \
-            "5" "Security Hardening" \
-            "6" "Diagnostics & Sanity Check" \
-            "7" "Service Management" \
-            "8" "Reboot / Shutdown" \
+            "5" "DFS Namespace Server" \
+            "6" "Security Hardening" \
+            "7" "Diagnostics & Sanity Check" \
+            "8" "Service Management" \
+            "9" "Reboot / Shutdown" \
             "Q" "Exit" \
             3>&1 1>&2 2>&3) || return
 
@@ -263,10 +264,11 @@ main_menu() {
             2) menu_domain_ops ;;
             3) menu_post_domain ;;
             4) menu_sysvol_sync ;;
-            5) menu_hardening ;;
-            6) menu_diagnostics ;;
-            7) menu_services ;;
-            8) menu_power ;;
+            5) menu_dfs ;;
+            6) menu_hardening ;;
+            7) menu_diagnostics ;;
+            8) menu_services ;;
+            9) menu_power ;;
             Q|q) clear; exit 0 ;;
         esac
     done
@@ -1276,8 +1278,662 @@ show_sync_status() {
 }
 
 #===============================================================================
-# 5. SECURITY HARDENING
+# 4b. DFS NAMESPACE
+#
+# Tertiary domain-based DFS-N namespace server. The Windows-side admin
+# adds this DC as a low-priority namespace root target; this code reads
+# the (replicated) AD link metadata and materializes it as MSDFS symlinks
+# under a Samba-hosted share.
+#
+# Design rationale and threat model live in docs/DFS-N.md. The short
+# version: AD content is not blindly trusted because we run as root and
+# create filesystem entries from it; pruning is gated to never delete
+# anything the tool didn't create; the Python helper does the binary
+# blob parse because msDFS-TargetListv2 is not a CSV.
 #===============================================================================
+readonly DFS_DEFAULT_ROOT="/srv/samba/dfs_root"
+readonly DFS_DEFAULT_SHARE="dfs_root"
+readonly DFS_INCLUDE_FILE="/etc/samba/conf.d/dfs-root.conf"
+readonly DFS_SENTINEL_NAME=".dfsn-managed"
+readonly DFS_LOCK="/run/samba-dfs-update.lock"
+readonly DFS_CONF="/etc/samba/dfs-update.conf"
+readonly DFS_PARSE_HELPER="/usr/local/sbin/samba-dfs-parse-targets"
+readonly DFS_UNIT="/etc/systemd/system/samba-dfs-update.service"
+readonly DFS_TIMER="/etc/systemd/system/samba-dfs-update.timer"
+readonly DFS_LOG="/var/log/samba/dfs-update.log"
+
+# Convert a dotted realm (lab.test) to a comma-joined base DN (DC=lab,DC=test).
+# Lower-cased on output. Returns 1 if smb.conf has no realm.
+_dfs_get_base_dn() {
+    local realm
+    realm=$(grep -oP '^[[:space:]]*realm[[:space:]]*=[[:space:]]*\K.*' \
+                /etc/samba/smb.conf 2>/dev/null | head -1 | tr A-Z a-z | tr -d '[:space:]\r')
+    [[ -z "$realm" ]] && return 1
+    local IFS=. parts=()
+    read -r -a parts <<< "$realm"
+    local dn="" p
+    for p in "${parts[@]}"; do dn+="DC=${p},"; done
+    printf '%s' "${dn%,}"
+}
+
+# Validate a single AD-sourced msDFS-LinkPathv2 component-by-component.
+# Output (on success): the relative POSIX path with the AD's leading slash
+# stripped. Real Windows-stored paths look like "/Reports" or
+# "/Sub/Folder" with FORWARD-slash separators (confirmed against a live
+# WS2025 namespace; what MS-DFSNM v1 documents differs).
+#
+# Rejection rules (each one paid for in security review): no controls, no
+# embedded backslashes (would smuggle a Windows path component), no
+# `..`/`.`/empty components, no Windows-reserved-in-NTFS chars, strict
+# length cap.
+_dfs_normalize_link_path() {
+    local raw="$1"
+    [[ -z "$raw" ]] && return 1
+    [[ "$raw" =~ [[:cntrl:]] ]] && return 1
+    # Backslash inside the path is a red flag — Windows uses backslash on
+    # the wire but stores forward slash in this attribute. A backslash here
+    # is either a malformed entry (raw-LDAP injection) or a traversal
+    # attempt; reject either way.
+    [[ "$raw" == *\\* ]] && return 1
+    # AD always carries a leading slash; strip it so we get a clean relative
+    # path. Reject anything that doesn't have it (defensive: real Windows
+    # always writes the slash).
+    [[ "$raw" != /* ]] && return 1
+    local rel="${raw#/}"
+    [[ -z "$rel" ]] && return 1
+    (( ${#rel} > 200 )) && return 1
+    # Per-component validation
+    local IFS=/ parts=() c
+    read -r -a parts <<< "$rel"
+    (( ${#parts[@]} == 0 )) && return 1
+    for c in "${parts[@]}"; do
+        [[ -z "$c" || "$c" == "." || "$c" == ".." ]] && return 1
+        # Reject the NTFS-reserved character set and the colon (which
+        # could be used to fake a stream/UNC suffix).
+        [[ "$c" == *[\\/:*?\"\<\>\|]* ]] && return 1
+    done
+    printf '%s' "$rel"
+}
+
+# Validate a parsed UNC target. Returns 0 if it looks safe to embed in a
+# comma-joined msdfs symlink target string. Implemented with string ops
+# rather than a single bash regex because escaping `[`, `]`, and the
+# structural backslashes inside `[[ =~ ]]` bracket expressions is a
+# minefield. Splitting it makes each rule readable and testable.
+_dfs_validate_target_unc() {
+    local unc="$1" rest server share
+    [[ "$unc" == \\\\* ]] || return 1                        # must start with \\
+    rest="${unc#\\\\}"
+    server="${rest%%\\*}"
+    [[ "$server" == "$rest" ]] && return 1                   # no separator backslash
+    share="${rest#*\\}"
+    [[ -z "$server" || -z "$share" ]] && return 1
+    # Server: NetBIOS-/DNS-safe host or short name.
+    [[ "$server" =~ ^[A-Za-z0-9._-]{1,63}$ ]] || return 1
+    # Share: 1..80 chars, letters/digits/space and a small set of safe
+    # punctuation. Reject anything that could corrupt the comma-joined
+    # target list or smuggle additional path components.
+    (( ${#share} >= 1 && ${#share} <= 80 )) || return 1
+    [[ "$share" == *","* ]]   && return 1
+    [[ "$share" == *"\\"* ]]  && return 1
+    [[ "$share" =~ ^[A-Za-z0-9._\$\ \&\(\)-]+$ ]] || return 1
+    return 0
+}
+
+# ldbsearch wraps long lines in LDIF. Unwrap so callers can grep -E reliably.
+# Continuation lines start with a single space.
+_dfs_unwrap_ldif() {
+    awk '
+        /^[^ ]/ { if (prev != "") print prev; prev = $0; next }
+        /^ /    { prev = prev substr($0, 2); next }
+        END     { if (prev != "") print prev }
+    '
+}
+
+# Render a base64-encoded msDFS-TargetListv2 blob into TSV records via
+# the Python helper. Each line:
+#   priorityClass\tpriorityRank\tstate\tunc
+# Helper exits non-zero on parse failure (handled below).
+_dfs_render_targets() {
+    local blob_b64="$1"
+    [[ -x "$DFS_PARSE_HELPER" ]] || { echo "[dfs] parse helper missing: $DFS_PARSE_HELPER" >&2; return 1; }
+    printf '%s' "$blob_b64" | "$DFS_PARSE_HELPER"
+}
+
+# Order targets first by AD-sourced priorityClass (DFS-N convention:
+# globalHigh, siteCostHigh, siteCostNormal, siteCostLow, globalLow), then
+# move SC_DFS_PREFER-regex matches to the front of each priority bucket.
+# Operator-supplied prefer thus refines AD priority; it can't override it
+# (which would defeat the point of the Windows-side priority configuration).
+#
+# Input on stdin: TSV records as emitted by the helper.
+# Output on stdout: one UNC per line, in chosen order.
+_dfs_order_targets() {
+    local prefer="${1:-}"
+    local -a recs=()
+    local rec
+    while IFS= read -r rec; do
+        [[ -z "$rec" ]] && continue
+        recs+=("$rec")
+    done
+    # AWK does the multi-key sort: numeric class rank, then prefer match,
+    # then preserve original order via line number. Bash 3.2 doesn't have
+    # multi-key sort; awk is everywhere and keeps the logic readable.
+    printf '%s\n' "${recs[@]}" | awk -F'\t' -v prefer="$prefer" '
+        BEGIN {
+            cls["globalHigh"]=0; cls["siteCostHigh"]=1; cls["siteCostNormal"]=2;
+            cls["siteCostLow"]=3; cls["globalLow"]=4; cls["manual"]=5
+        }
+        {
+            c = (($1 in cls) ? cls[$1] : 9)
+            p = (prefer != "" && $4 ~ prefer) ? 0 : 1
+            printf "%d\t%d\t%06d\t%s\n", c, p, NR, $4
+        }
+    ' | sort -t $'\t' -k1,1n -k2,2n -k3,3n | awk -F'\t' '{print $4}'
+}
+
+# Atomic-swap a msdfs symlink. Caller passes the full literal symlink target
+# (e.g. "msdfs:srv1\share,srv2\share"). Idempotent: if the existing symlink
+# already has this target, no-op.
+_dfs_write_symlink() {
+    local link_path="$1" target="$2"
+    if [[ -L "$link_path" ]]; then
+        local cur
+        cur=$(readlink "$link_path" 2>/dev/null || true)
+        [[ "$cur" == "$target" ]] && return 0
+    fi
+    local tmp="${link_path}.tmp.$$"
+    rm -f "$tmp"
+    ln -s "$target" "$tmp" || return 1
+    mv -T "$tmp" "$link_path"
+}
+
+# Walk the namespace dir and remove only entries we own: symlinks whose
+# target begins with "msdfs:" AND whose POSIX path is not in the
+# authoritative-set file ($1). Anything else (regular files, foreign
+# symlinks, non-empty directories) is logged and left alone. After unlinks,
+# rmdir empty descendant directories bottom-up.
+_dfs_prune() {
+    local ns_root="$1" keep_file="$2"
+    local link rel
+    while IFS= read -r -d '' link; do
+        rel="${link#$ns_root/}"
+        if grep -Fxq "$rel" "$keep_file"; then continue; fi
+        local tgt
+        tgt=$(readlink "$link" 2>/dev/null || true)
+        if [[ "$tgt" == msdfs:* ]]; then
+            echo "[dfs] prune symlink: $rel" >&2
+            rm -f "$link"
+        else
+            echo "[dfs] WARN foreign symlink left in place: $rel -> $tgt" >&2
+        fi
+    done < <(find "$ns_root" -mindepth 1 -type l -print0)
+
+    # Empty-dir prune, bottom-up. Stops at $ns_root.
+    find "$ns_root" -mindepth 1 -depth -type d -empty -print0 \
+        | xargs -0 -r rmdir 2>/dev/null || true
+}
+
+# Idempotently install the smb.conf drop-in for the namespace share.
+# Note: read only = yes is intentional. Clients are referred to targets;
+# they never write to the namespace root itself. Privileged writes happen
+# locally as root.
+_dfs_write_drop_in() {
+    local root_path="$1" share="$2"
+    install -d -m 0755 /etc/samba/conf.d
+    cat > "$DFS_INCLUDE_FILE" <<DROPEOF
+# Managed by samba-sconfig dfs-init. Edits will be overwritten.
+[${share}]
+    path = ${root_path}
+    msdfs root = yes
+    read only = yes
+    guest ok = no
+    vfs objects = acl_xattr
+DROPEOF
+    chmod 0644 "$DFS_INCLUDE_FILE"
+
+    local smb=/etc/samba/smb.conf
+    if ! grep -qF "include = $DFS_INCLUDE_FILE" "$smb" 2>/dev/null; then
+        # Insert INTO [global], not at EOF. The post-provision smb.conf
+        # ends with [sysvol]/[netlogon], so an EOF append lands inside
+        # the last service section. Samba still parses the include's
+        # own [dfs_root] section header, but testparm reports the
+        # include line as a service parameter — confusing and brittle.
+        # Mirrors the technique in apply_hardening_to_smb_conf.
+        local tmp
+        tmp=$(mktemp)
+        awk -v inc="$DFS_INCLUDE_FILE" '
+            BEGIN { inserted = 0 }
+            /^\[global\][[:space:]]*$/ && !inserted {
+                print
+                print "\t# Added by samba-sconfig dfs-init"
+                print "\tinclude = " inc
+                inserted = 1
+                next
+            }
+            { print }
+        ' "$smb" > "$tmp"
+        cat "$tmp" > "$smb"
+        rm -f "$tmp"
+    fi
+
+    # host msdfs is on by default in modern Samba; assert defensively.
+    if ! testparm -s --parameter-name='host msdfs' 2>/dev/null | grep -qi '^Yes'; then
+        if ! grep -qE '^[[:space:]]*host msdfs[[:space:]]*=' "$smb"; then
+            sed -i '/^\[global\]/a\        host msdfs = yes' "$smb"
+        fi
+    fi
+}
+
+_dfs_remove_drop_in() {
+    rm -f "$DFS_INCLUDE_FILE"
+    # Match the indented (\t-prefixed) form inserted by _dfs_write_drop_in.
+    sed -i '/^\t# Added by samba-sconfig dfs-init$/{N;/include = \/etc\/samba\/conf.d\/dfs-root.conf/d}' \
+        /etc/samba/smb.conf 2>/dev/null || true
+}
+
+# Install systemd unit + timer. Service runs as root because it writes
+# under the namespace root and reads sam.ldb. Hardening below removes
+# everything we don't need.
+_dfs_install_units() {
+    local interval="$1"
+    cat > "$DFS_UNIT" <<UNITEOF
+[Unit]
+Description=Samba DFS-N namespace symlink updater
+After=samba-ad-dc.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/samba-sconfig dfs-update
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=${DFS_DEFAULT_ROOT} /run /var/log/samba
+ReadOnlyPaths=/var/lib/samba
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UNITEOF
+    cat > "$DFS_TIMER" <<TIMEREOF
+[Unit]
+Description=Periodic Samba DFS-N namespace sync
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}
+RandomizedDelaySec=2min
+Persistent=true
+Unit=samba-dfs-update.service
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+    systemctl daemon-reload
+    systemctl enable --now samba-dfs-update.timer
+}
+
+_dfs_remove_units() {
+    systemctl disable --now samba-dfs-update.timer 2>/dev/null || true
+    rm -f "$DFS_UNIT" "$DFS_TIMER"
+    systemctl daemon-reload
+}
+
+# The headless update entry point. Read config, take lock, walk namespaces.
+_dfs_run_update() {
+    local dry="${SC_DFS_DRY_RUN:-0}"
+
+    [[ -f "$DFS_CONF" ]] || { echo "[dfs] no config — run dfs-init first" >&2; return 1; }
+    # shellcheck disable=SC1090
+    source "$DFS_CONF"
+    : "${DFS_NAMESPACES:=}"
+    : "${DFS_PREFER:=}"
+    : "${DFS_ROOT:=$DFS_DEFAULT_ROOT}"
+    [[ -z "$DFS_NAMESPACES" ]] && { echo "[dfs] DFS_NAMESPACES empty — nothing to do" >&2; return 0; }
+    [[ -f "${DFS_ROOT}/${DFS_SENTINEL_NAME}" ]] || {
+        echo "[dfs] sentinel ${DFS_SENTINEL_NAME} missing under ${DFS_ROOT} — refusing to operate" >&2
+        return 2
+    }
+
+    local base_dn
+    base_dn=$(_dfs_get_base_dn) || { echo "[dfs] could not derive base DN" >&2; return 1; }
+
+    # Take the lock. flock returns 1 on contention; we exit 0 silently because
+    # a missed run is harmless — the next timer tick picks up.
+    exec 9>"$DFS_LOCK" || { echo "[dfs] cannot open lock $DFS_LOCK" >&2; return 1; }
+    if ! flock -n 9; then
+        echo "[dfs] another update is in progress; exiting" >&2
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$DFS_LOG")"
+    {
+        echo "=== $(date -Is) update begin (namespaces: $DFS_NAMESPACES) ==="
+    } >> "$DFS_LOG"
+
+    local ns rc=0
+    for ns in $DFS_NAMESPACES; do
+        _dfs_update_one_namespace "$ns" "$base_dn" "$dry" || rc=$?
+    done
+
+    if [[ "$dry" != "1" ]]; then
+        smbcontrol all reload-config 2>/dev/null || true
+    fi
+
+    {
+        echo "=== $(date -Is) update end (rc=$rc) ==="
+    } >> "$DFS_LOG"
+    return "$rc"
+}
+
+# Core per-namespace pass. Three guards:
+#  - empty result: warn, leave filesystem alone, do not prune.
+#  - sentinel missing on the per-NS dir: refuse to operate on that NS.
+#  - prune scope: only msdfs:* symlinks under the per-NS subtree, never
+#    files we don't own.
+_dfs_update_one_namespace() {
+    local ns="$1" base_dn="$2" dry="$3"
+    local ns_root="${DFS_ROOT}/${ns}"
+
+    # Per-NS sentinel mirrors the global one; protects against
+    # accidentally pointing at an unrelated directory.
+    if [[ ! -d "$ns_root" || ! -f "${ns_root}/${DFS_SENTINEL_NAME}" ]]; then
+        echo "[dfs/${ns}] per-namespace dir or sentinel missing — skipping" >&2
+        return 1
+    fi
+
+    # AD layout (confirmed against a live WS2025 forest, NOT what the
+    # MS-DFSNM v1 doc suggests):
+    #   CN=<NS>,CN=Dfs-Configuration,CN=System,<dn>           ← namespace anchor
+    #     └── CN=<NS>,CN=<NS>,CN=Dfs-Configuration,...        ← link container
+    #           └── CN=link-<guid>,...                        ← msDFS-Linkv2
+    # Note "Dfs-Configuration" (no "n"), the doubled namespace component,
+    # and the link-<guid> RDN.
+    local search_base="CN=${ns},CN=${ns},CN=Dfs-Configuration,CN=System,${base_dn}"
+    local raw
+    raw=$(ldbsearch -H /var/lib/samba/private/sam.ldb -b "$search_base" -s sub \
+            '(objectClass=msDFS-Linkv2)' msDFS-LinkPathv2 msDFS-TargetListv2 2>&1) || {
+        echo "[dfs/${ns}] ldbsearch failed:" >&2
+        echo "$raw" | head -3 >&2
+        return 1
+    }
+
+    # Unwrap LDIF continuation lines first.
+    local unwrapped
+    unwrapped=$(printf '%s\n' "$raw" | _dfs_unwrap_ldif)
+
+    # Empty-result guard: if we see no link-path attributes at all, refuse to
+    # prune. An empty namespace is valid; we just exit without changes.
+    local link_count
+    link_count=$(grep -c '^msDFS-LinkPathv2: ' <<< "$unwrapped" || true)
+    if (( link_count == 0 )); then
+        echo "[dfs/${ns}] zero links returned — skipping prune (safety)" >&2
+        return 0
+    fi
+
+    local keep_file
+    keep_file=$(mktemp)
+    trap 'rm -f "$keep_file"' RETURN
+
+    # Walk records. LDIF groups attrs of one entry between successive
+    # `dn:` lines (or a blank line at the end). We commit the record on
+    # those boundaries rather than when we see TargetListv2, so the
+    # parser is order-independent — ldb returns attrs alphabetically
+    # today but that's not load-bearing.
+    local cur_path="" cur_blob=""
+    local applied=0 rejected=0
+    _flush() {
+        if [[ -n "$cur_path" && -n "$cur_blob" ]]; then
+            if _dfs_apply_one_link "$ns" "$ns_root" "$cur_path" "$cur_blob" "$keep_file" "$dry"; then
+                applied=$((applied+1))
+            else
+                rejected=$((rejected+1))
+            fi
+        fi
+        cur_path=""; cur_blob=""
+    }
+    while IFS= read -r line; do
+        case "$line" in
+          'dn: '*)                  _flush ;;
+          '')                       _flush ;;
+          'msDFS-LinkPathv2: '*)    cur_path="${line#msDFS-LinkPathv2: }" ;;
+          'msDFS-TargetListv2:: '*) cur_blob="${line#msDFS-TargetListv2:: }" ;;
+        esac
+    done <<< "$unwrapped"
+    _flush
+
+    echo "[dfs/${ns}] applied=${applied} rejected=${rejected}" >&2
+    {
+        echo "$(date -Is) ns=${ns} applied=${applied} rejected=${rejected} dry=${dry}"
+    } >> "$DFS_LOG"
+
+    if [[ "$dry" != "1" && "$applied" -gt 0 ]]; then
+        _dfs_prune "$ns_root" "$keep_file"
+    fi
+    return 0
+}
+
+# Apply one link record. Validates path + targets, orders, writes the
+# symlink atomically, records the kept path in $keep_file.
+_dfs_apply_one_link() {
+    local ns="$1" ns_root="$2" raw_path="$3" blob_b64="$4" keep_file="$5" dry="$6"
+    local rel
+    rel=$(_dfs_normalize_link_path "$raw_path") || {
+        echo "[dfs/${ns}] reject path: $raw_path" >&2
+        return 1
+    }
+
+    # The helper emits TSV records: priorityClass\tpriorityRank\tstate\tunc.
+    local tsv_records
+    tsv_records=$(_dfs_render_targets "$blob_b64") || {
+        echo "[dfs/${ns}] target parse failed for: $rel" >&2
+        return 1
+    }
+
+    # Validate every UNC. One bad target rejects the whole link — partial
+    # target lists would silently downgrade the referral. The 4th tab-
+    # separated field is the UNC.
+    local rec u
+    while IFS= read -r rec; do
+        [[ -z "$rec" ]] && continue
+        u="${rec##*$'\t'}"
+        _dfs_validate_target_unc "$u" || {
+            echo "[dfs/${ns}] reject target: $u (link $rel)" >&2
+            return 1
+        }
+    done <<< "$tsv_records"
+
+    # Order by AD priority class first, then by prefer regex within each
+    # bucket. Output is one UNC per line.
+    local ordered
+    ordered=$(printf '%s\n' "$tsv_records" | _dfs_order_targets "${DFS_PREFER:-}")
+
+    # Build the symlink target string: "msdfs:srv1\share,srv2\share"
+    local joined="" first=1
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        u="${u#\\\\}"   # strip leading \\ for msdfs symlink syntax
+        if (( first )); then joined+="$u"; first=0; else joined+=",$u"; fi
+    done <<< "$ordered"
+    [[ -z "$joined" ]] && return 1
+    joined="msdfs:${joined}"
+
+    local link_path="${ns_root}/${rel}"
+    if [[ "$dry" == "1" ]]; then
+        echo "[dfs/${ns}] DRY $rel -> $joined" >&2
+    else
+        local parent parent_real ns_real
+        parent=$(dirname "$link_path")
+        # Realpath check BEFORE mkdir. realpath -m resolves symbolically
+        # without requiring the path to exist, so we can refuse a
+        # containment violation without first creating directories
+        # outside the namespace root. This is the second lock; the first
+        # is _dfs_normalize_link_path. Both must hold.
+        parent_real=$(realpath -m "$parent")
+        ns_real=$(realpath -m "$ns_root")
+        if [[ "$parent_real" != "$ns_real" && "$parent_real" != "$ns_real"/* ]]; then
+            echo "[dfs/${ns}] containment violation: $rel" >&2
+            return 1
+        fi
+        mkdir -p "$parent" || return 1
+        _dfs_write_symlink "$link_path" "$joined" || {
+            echo "[dfs/${ns}] write failed: $rel" >&2
+            return 1
+        }
+    fi
+    printf '%s\n' "$rel" >> "$keep_file"
+    return 0
+}
+
+#----------------------------- TUI submenu --------------------------------------
+menu_dfs() {
+    is_provisioned || { info "Not provisioned. Use Domain Operations (2) first."; return; }
+    while true; do
+        local state="not configured" timer="off" ns="<none>"
+        if [[ -f "$DFS_CONF" ]]; then
+            state="configured"
+            ns=$(awk -F'"' '/^DFS_NAMESPACES=/ {print $2}' "$DFS_CONF" 2>/dev/null)
+            [[ -z "$ns" ]] && ns="<none>"
+        fi
+        systemctl is-active samba-dfs-update.timer &>/dev/null && timer="on"
+        local choice
+        choice=$(whiptail --title "DFS Namespace Server" \
+            --menu "Tertiary domain-based DFS-N namespace server.\nState: ${state}  Timer: ${timer}  Namespaces: ${ns}" \
+            $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+            "1" "Initialize namespace server (one-time)" \
+            "2" "Configure namespaces and prefer-list" \
+            "3" "Run sync now (dry-run)" \
+            "4" "Run sync now" \
+            "5" "Schedule periodic sync" \
+            "6" "Pause / resume timer" \
+            "7" "Show DFS-N status" \
+            "8" "Remove DFS-N configuration" \
+            "B" "Back" \
+            3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            1) tui_dfs_init ;;
+            2) tui_dfs_configure ;;
+            3) tui_dfs_run 1 ;;
+            4) tui_dfs_run 0 ;;
+            5) tui_dfs_schedule ;;
+            6) tui_dfs_timer_toggle ;;
+            7) tui_dfs_status ;;
+            8) tui_dfs_remove ;;
+            B|b) return ;;
+        esac
+    done
+}
+
+# Capture sconfig output safely. The earlier `cmd 2>&1 | whiptail msgbox
+# "$(cat)"` pattern depends on $(cat) reading the pipeline's stdout, which
+# is fragile when whiptail eats stdin on its own side. Capture into a var
+# first, then feed whiptail explicitly.
+_tui_show() {
+    local title="$1" body="$2" h="${3:-20}" w="${4:-78}"
+    whiptail --title "$title" --scrolltext --msgbox "$body" "$h" "$w"
+}
+
+tui_dfs_init() {
+    local share root
+    share=$(whiptail --inputbox \
+        "DFS-N share name. Clients connect to \\\\<dc>\\<share>.\nMust match: letters/digits, dot, underscore, dash. Default: ${DFS_DEFAULT_SHARE}." \
+        12 70 "$DFS_DEFAULT_SHARE" 3>&1 1>&2 2>&3) || return
+    [[ "$share" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { info "Invalid share name."; return; }
+    root=$(whiptail --inputbox \
+        "Filesystem path for the namespace store. Must be absolute.\nDefault: ${DFS_DEFAULT_ROOT}." \
+        11 70 "$DFS_DEFAULT_ROOT" 3>&1 1>&2 2>&3) || return
+    [[ "$root" = /* ]] || { info "Path must be absolute."; return; }
+    local out
+    out=$(cli_dfs_init_inner "$share" "$root" 2>&1)
+    out+=$'\n\nNext step: pick "Configure namespaces and prefer-list" (menu 2).'
+    _tui_show "dfs-init" "$out" 18 78
+}
+
+tui_dfs_configure() {
+    [[ -f "$DFS_CONF" ]] || { info "Run Initialize (menu 1) first."; return; }
+    # shellcheck disable=SC1090
+    source "$DFS_CONF"
+    local ns prefer
+    ns=$(whiptail --inputbox \
+        "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-64 chars, letters/digits/dot/underscore/dash." \
+        12 72 "${DFS_NAMESPACES:-}" 3>&1 1>&2 2>&3) || return
+    prefer=$(whiptail --inputbox \
+        "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of each priority bucket. Leave blank to use AD priorityClass only.\nExample: ^\\\\\\\\WIN-" \
+        13 72 "${DFS_PREFER:-}" 3>&1 1>&2 2>&3) || return
+    # Delegate to the CLI subcommand so name validation is shared.
+    local out
+    out=$(SC_DFS_PREFER="$prefer" cli_dfs_configure $ns 2>&1) || {
+        _tui_show "dfs-configure: rejected" "$out" 14 76
+        return
+    }
+    out+=$'\n\nNext step: "Run sync now (dry-run)" (menu 3) to preview, then\n"Run sync now" (menu 4). Schedule periodic via menu 5.'
+    _tui_show "dfs-configure" "$out" 16 78
+}
+
+# $1 = 1 for dry-run, 0 for real
+tui_dfs_run() {
+    [[ -f "$DFS_CONF" ]] || { info "Not configured. Run Initialize + Configure first."; return; }
+    local dry="$1" title="DFS sync"
+    [[ "$dry" == "1" ]] && title="DFS sync (dry-run)"
+    yesno "$title — proceed?" || return
+    whiptail --infobox "Running…" 6 40
+    local out rc
+    if [[ "$dry" == "1" ]]; then
+        out=$(SC_DFS_DRY_RUN=1 _dfs_run_update 2>&1); rc=$?
+    else
+        out=$(_dfs_run_update 2>&1); rc=$?
+    fi
+    local verdict="OK (rc=$rc)"
+    (( rc != 0 )) && verdict="FAILED (rc=$rc)"
+    _tui_show "$title — $verdict" "$out" 24 90
+}
+
+tui_dfs_schedule() {
+    [[ -f "$DFS_CONF" ]] || { info "Not configured. Run Initialize + Configure first."; return; }
+    local interval
+    interval=$(whiptail --inputbox \
+        "Timer interval (systemd time spec, e.g. 15min, 30min, 1h).\nDFS-N config changes slowly; 30min is a good default. Lower\nvalues mean more journal traffic for little practical benefit." \
+        13 70 "30min" 3>&1 1>&2 2>&3) || return
+    # Loose syntactic check; systemd is the authoritative validator. Catches
+    # the most common typo (forgetting the unit suffix).
+    [[ "$interval" =~ ^[0-9]+(s|sec|second|seconds|m|min|minute|minutes|h|hr|hour|hours|d|day|days)$ ]] \
+        || { info "Interval must be a systemd time spec (e.g. 15min, 1h)."; return; }
+    local out
+    out=$(cli_dfs_schedule_inner "$interval" 2>&1)
+    _tui_show "dfs-schedule" "$out" 18 78
+}
+
+tui_dfs_timer_toggle() {
+    if systemctl is-active samba-dfs-update.timer &>/dev/null; then
+        yesno "Stop the periodic sync timer?\n\n(Configuration is preserved; resume via this menu later.)" || return
+        local out; out=$(systemctl stop samba-dfs-update.timer 2>&1)
+        _tui_show "Timer paused" "${out:-Timer stopped.}" 10 60
+    else
+        # Only resume if the unit files actually exist (i.e. schedule was
+        # run before). Otherwise nudge the operator to schedule first.
+        [[ -f "$DFS_TIMER" ]] || { info "Timer is not installed yet. Use Schedule (menu 5)."; return; }
+        yesno "Start the periodic sync timer?" || return
+        local out; out=$(systemctl start samba-dfs-update.timer 2>&1)
+        _tui_show "Timer resumed" "${out:-Timer started.}" 10 60
+    fi
+}
+
+tui_dfs_status() {
+    local out
+    out=$(cli_dfs_status 2>&1)
+    _tui_show "DFS-N Status" "$out" 24 90
+}
+
+tui_dfs_remove() {
+    yesno "Remove DFS-N drop-in, systemd units, and config?\n\nFilesystem under the namespace root is left intact;\nyou can rm -rf it manually if desired." || return
+    local out
+    out=$(cli_dfs_remove 2>&1)
+    _tui_show "dfs-remove" "$out" 14 76
+}
 menu_hardening() {
     while true; do
         local choice
@@ -1689,6 +2345,118 @@ cli_provision_new() {
     fi
 }
 
+cli_dfs_init_inner() {
+    local share="$1" root="$2"
+    [[ -n "$share" && -n "$root" ]] || { echo "[dfs-init] share and root required" >&2; return 1; }
+    [[ "$root" = /* ]] || { echo "[dfs-init] root must be absolute" >&2; return 1; }
+    install -d -m 0755 "$root"
+    : > "${root}/${DFS_SENTINEL_NAME}"
+    chmod 0644 "${root}/${DFS_SENTINEL_NAME}"
+    _dfs_write_drop_in "$root" "$share"
+    if [[ ! -f "$DFS_CONF" ]]; then
+        cat > "$DFS_CONF" <<CONFEOF
+# Managed by samba-sconfig dfs-* commands.
+DFS_ROOT="${root}"
+DFS_SHARE="${share}"
+DFS_NAMESPACES=""
+DFS_PREFER=""
+CONFEOF
+        chmod 0644 "$DFS_CONF"
+    else
+        sed -i \
+            -e "s|^DFS_ROOT=.*|DFS_ROOT=\"${root}\"|" \
+            -e "s|^DFS_SHARE=.*|DFS_SHARE=\"${share}\"|" \
+            "$DFS_CONF"
+    fi
+    smbcontrol all reload-config 2>/dev/null || true
+    echo "[dfs-init] done. Configure namespaces with: samba-sconfig dfs-configure NS1 [NS2 ...]"
+}
+
+cli_dfs_init() {
+    local share="${SC_DFS_SHARE:-$DFS_DEFAULT_SHARE}"
+    local root="${SC_DFS_ROOT:-$DFS_DEFAULT_ROOT}"
+    cli_dfs_init_inner "$share" "$root"
+}
+
+cli_dfs_configure() {
+    [[ -f "$DFS_CONF" ]] || { echo "[dfs-configure] run dfs-init first" >&2; return 1; }
+    # shellcheck disable=SC1090
+    source "$DFS_CONF"
+    local ns_list="${SC_DFS_NS:-$*}"
+    local prefer="${SC_DFS_PREFER:-${DFS_PREFER:-}}"
+    [[ -z "$ns_list" ]] && { echo "[dfs-configure] no namespaces given" >&2; return 1; }
+    local n
+    for n in $ns_list; do
+        # Reuse the same character class we trust for path components.
+        [[ "$n" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "[dfs-configure] reject namespace name: $n" >&2; return 1; }
+        install -d -m 0755 "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}"
+        : > "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}/${DFS_SENTINEL_NAME}"
+    done
+    sed -i \
+        -e "s|^DFS_NAMESPACES=.*|DFS_NAMESPACES=\"${ns_list}\"|" \
+        -e "s|^DFS_PREFER=.*|DFS_PREFER=\"${prefer}\"|" \
+        "$DFS_CONF"
+    echo "[dfs-configure] namespaces=${ns_list} prefer=${prefer:-<none>}"
+}
+
+cli_dfs_update() {
+    _dfs_run_update
+}
+
+cli_dfs_schedule_inner() {
+    local interval="$1"
+    [[ -n "$interval" ]] || { echo "[dfs-schedule] interval required" >&2; return 1; }
+    _dfs_install_units "$interval"
+    echo "[dfs-schedule] timer enabled, interval=$interval"
+    systemctl status --no-pager samba-dfs-update.timer | head -8 || true
+}
+
+cli_dfs_schedule() {
+    local interval="${SC_DFS_INTERVAL:-30min}"
+    cli_dfs_schedule_inner "$interval"
+}
+
+cli_dfs_status() {
+    echo "Drop-in:    ${DFS_INCLUDE_FILE} $([[ -f $DFS_INCLUDE_FILE ]] && echo present || echo absent)"
+    echo "Config:     ${DFS_CONF} $([[ -f $DFS_CONF ]] && echo present || echo absent)"
+    if [[ -f "$DFS_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$DFS_CONF"
+        echo "Root:       ${DFS_ROOT:-?}"
+        echo "Share:      ${DFS_SHARE:-?}"
+        echo "Namespaces: ${DFS_NAMESPACES:-<none>}"
+        echo "Prefer:     ${DFS_PREFER:-<none>}"
+    fi
+    # `systemctl is-active` always prints a status word to stdout (even on
+    # failure) and exits non-zero when the unit isn't active. Capturing
+    # via $() takes that stdout; the previous form added a redundant
+    # `|| echo inactive` that produced a doubled status line.
+    local _t _s
+    _t=$(systemctl is-active samba-dfs-update.timer 2>/dev/null)
+    _s=$(systemctl is-active samba-dfs-update.service 2>/dev/null)
+    echo "Timer:      ${_t:-unknown}"
+    echo "Service:    ${_s:-unknown}"
+    if [[ -f "$DFS_LOG" ]]; then
+        echo
+        echo "--- last 12 log lines ---"
+        tail -12 "$DFS_LOG"
+    fi
+    if [[ -f "$DFS_CONF" ]] && [[ -d "${DFS_ROOT:-$DFS_DEFAULT_ROOT}" ]]; then
+        echo
+        echo "--- managed symlinks ---"
+        find "${DFS_ROOT:-$DFS_DEFAULT_ROOT}" -mindepth 1 -type l -printf '%P -> %l\n' 2>/dev/null | head -40 || true
+    fi
+}
+
+cli_dfs_remove() {
+    _dfs_remove_units
+    _dfs_remove_drop_in
+    rm -f "$DFS_CONF"
+    smbcontrol all reload-config 2>/dev/null || true
+    echo "[dfs-remove] units, drop-in, and config removed."
+    echo "[dfs-remove] filesystem under ${DFS_DEFAULT_ROOT} left intact (rm -rf manually if desired)."
+}
+
 usage_cli() {
     cat <<USAGE
 Usage: samba-sconfig                       # interactive TUI
@@ -1702,6 +2470,21 @@ Usage: samba-sconfig                       # interactive TUI
        samba-sconfig provision-new         # headless new-forest provision
            required env: SC_REALM, SC_NETBIOS, SC_PASS
            optional env: SC_FWD (default: 1.1.1.1)
+
+DFS-N (domain-based namespace tertiary target):
+       samba-sconfig dfs-init              # install drop-in share + sentinel
+           optional env: SC_DFS_ROOT (default: ${DFS_DEFAULT_ROOT})
+                         SC_DFS_SHARE (default: ${DFS_DEFAULT_SHARE})
+       samba-sconfig dfs-configure NS [NS ...]
+                                           # set namespaces and prefer-regex
+           optional env: SC_DFS_NS (overrides positional list)
+                         SC_DFS_PREFER (extended regex; matches bubble to front)
+       samba-sconfig dfs-update            # one sync pass
+           optional env: SC_DFS_DRY_RUN=1  (no filesystem writes)
+       samba-sconfig dfs-schedule          # install systemd timer
+           optional env: SC_DFS_INTERVAL (default: 30min)
+       samba-sconfig dfs-status            # show config, units, recent log
+       samba-sconfig dfs-remove            # tear down (filesystem left alone)
 USAGE
 }
 
@@ -1715,6 +2498,12 @@ case "${1:-}" in
     probe-fl)       shift; cli_probe_fl "$@" ;;
     join-dc)        cli_join_dc ;;
     provision-new)  cli_provision_new ;;
+    dfs-init)       cli_dfs_init ;;
+    dfs-configure)  shift; cli_dfs_configure "$@" ;;
+    dfs-update)     cli_dfs_update ;;
+    dfs-schedule)   cli_dfs_schedule ;;
+    dfs-status)     cli_dfs_status ;;
+    dfs-remove)     cli_dfs_remove ;;
     -h|--help)      usage_cli ;;
     *)              echo "Unknown subcommand: $1" >&2; usage_cli >&2; exit 2 ;;
 esac
