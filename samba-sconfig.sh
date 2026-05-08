@@ -29,6 +29,20 @@ readonly WT_MENU_HEIGHT=14
 #===============================================================================
 # UTILITIES
 #===============================================================================
+# Source the shared appliance-core libs that prepare-image.sh §18b
+# vendored to /usr/local/lib/appliance-core/. The libs are idempotent
+# (sentinel-guarded), so sourcing every time samba-sconfig starts is
+# cheap and keeps the dependency direction explicit. If the libs
+# weren't vendored (older image, broken build), warn-and-continue —
+# the sconfig still works for paths that don't depend on them.
+APPCORE_LIBS=/usr/local/lib/appliance-core
+if [[ -d "$APPCORE_LIBS" ]]; then
+    [[ -f "$APPCORE_LIBS/identity.sh" ]] && source "$APPCORE_LIBS/identity.sh"
+    [[ -f "$APPCORE_LIBS/tui.sh"      ]] && source "$APPCORE_LIBS/tui.sh"
+    [[ -f "$APPCORE_LIBS/hostname.sh" ]] && source "$APPCORE_LIBS/hostname.sh"
+    [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
+fi
+
 die()  { whiptail --msgbox "FATAL: $*" 10 60; exit 1; }
 info() { whiptail --msgbox "$*" 12 64; }
 yesno(){ whiptail --yesno "$*" 10 60; }
@@ -322,72 +336,19 @@ config_hostname() {
         return
     fi
 
-    local cur_short cur_domain
-    cur_short=$(hostname -s 2>/dev/null || hostname)
-    cur_domain=$(dnsdomainname 2>/dev/null || true)
-
-    # Live-detect the default domain. Order:
-    #   1. DHCP search domain (resolvectl) — what the network just told us.
-    #   2. Reverse-DNS domain for our IP — second-best signal.
-    #   3. The current dnsdomainname — last resort, may itself be stale.
-    # The previous behavior pre-filled with the FULL current FQDN, which
-    # baked stale realms (e.g. 'lab.test' from a long-gone join) into
-    # every subsequent prompt.
-    local default_domain=""
-    default_domain=$(resolvectl domain 2>/dev/null \
-        | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) {
-                                gsub(/^~/,"",$i)
-                                if ($i!="" && $i!=".") {print $i; exit}
-                              }}')
-    if [[ -z "$default_domain" ]]; then
-        local ip_only
-        ip_only=$(get_ip | cut -d/ -f1)
-        if [[ -n "$ip_only" ]]; then
-            local ptr
-            ptr=$(timeout 5 dig +short -x "$ip_only" 2>/dev/null \
-                    | awk 'NR==1 {sub(/\.$/,""); print}')
-            if [[ -n "$ptr" && "$ptr" == *.* ]]; then
-                default_domain="${ptr#*.}"
-            fi
-        fi
-    fi
-    [[ -z "$default_domain" ]] && default_domain="$cur_domain"
-
-    local new_short
-    new_short=$(whiptail --inputbox \
-        "New hostname (SHORT name only — domain part is derived).\n\nNetBIOS limit: 15 chars, must start with a letter,\nallowed chars [A-Za-z0-9-].\n\nCurrent: ${cur_short}\nDomain (auto): ${default_domain:-<none>}" \
-        15 70 "$cur_short" \
-        3>&1 1>&2 2>&3) || return
-    [[ -n "$new_short" ]] || return
-    if ! [[ "$new_short" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ ]]; then
-        info "ERROR: must start with a letter, [A-Za-z0-9-] only, 1-15 chars (NetBIOS limit)."
-        return
-    fi
-    if [[ "$default_domain" == *.local ]]; then
-        info "ERROR: detected domain '${default_domain}' ends in .local which conflicts with mDNS.\nFix the network's DHCP/PTR domain first."
+    # The actual rename flow lives in the appliance-core hostname.sh
+    # lib (live DHCP/PTR/dnsdomainname domain detection, NetBIOS-rules
+    # short-name validation, safe /etc/hosts rewrite). The post-provision
+    # guard above is the only product-specific bit; everything else is
+    # shared with smb-proxy and any future appliance.
+    if ! command -v appcore_hostname_change_tui >/dev/null 2>&1; then
+        info "appliance-core libs not vendored on this image.\nRebuild via lab/build-fresh-base.sh, or copy ../appliance-core/lib/*.sh to /usr/local/lib/appliance-core/ by hand."
         return
     fi
 
-    local new_fqdn="$new_short"
-    [[ -n "$default_domain" ]] && new_fqdn="${new_short}.${default_domain}"
-
-    local ip_addr
-    ip_addr=$(get_ip | cut -d/ -f1)
-
-    hostnamectl set-hostname "$new_fqdn"
-    echo "$new_fqdn" > /etc/hostname
-
-    # Refresh /etc/hosts. Drop any prior entry for our IP or our old
-    # short name, then add the canonical line.
-    [[ -n "$ip_addr" ]] && sed -i "/^${ip_addr}[[:space:]]/d" /etc/hosts 2>/dev/null || true
-    sed -i "/[[:space:]]${cur_short}\([[:space:]]\|\$\)/d" /etc/hosts 2>/dev/null || true
-    if [[ -n "$default_domain" && -n "$ip_addr" ]]; then
-        echo "${ip_addr}  ${new_fqdn}  ${new_short}" >> /etc/hosts
-    elif [[ -n "$ip_addr" ]]; then
-        echo "${ip_addr}  ${new_short}" >> /etc/hosts
+    if appcore_hostname_change_tui; then
+        info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended so all services pick it up."
     fi
-
-    info "Hostname set to: ${new_fqdn}\nShort: ${new_short}\n\nReboot recommended so all services pick it up."
 }
 
 get_addr_source() {
@@ -1416,26 +1377,29 @@ _dfs_normalize_link_path() {
 }
 
 # Validate a parsed UNC target. Returns 0 if it looks safe to embed in a
-# comma-joined msdfs symlink target string. Implemented with string ops
-# rather than a single bash regex because escaping `[`, `]`, and the
-# structural backslashes inside `[[ =~ ]]` bracket expressions is a
-# minefield. Splitting it makes each rule readable and testable.
+# comma-joined msdfs symlink target string. The actual validation lives
+# in appliance-core's identity.sh (appcore_id_unc_validate); this thin
+# wrapper preserves the function name local code already calls and
+# falls back to the inline rules when the lib isn't vendored (older
+# image, broken build).
 _dfs_validate_target_unc() {
-    local unc="$1" rest server share
-    [[ "$unc" == \\\\* ]] || return 1                        # must start with \\
+    local unc="$1"
+    if command -v appcore_id_unc_validate >/dev/null 2>&1; then
+        appcore_id_unc_validate "$unc"
+        return
+    fi
+    # Fallback (kept terse): reject anything that could corrupt the
+    # comma-joined target list or smuggle additional backslashes.
+    local rest server share
+    [[ "$unc" == \\\\* ]] || return 1
     rest="${unc#\\\\}"
     server="${rest%%\\*}"
-    [[ "$server" == "$rest" ]] && return 1                   # no separator backslash
+    [[ "$server" == "$rest" ]] && return 1
     share="${rest#*\\}"
     [[ -z "$server" || -z "$share" ]] && return 1
-    # Server: NetBIOS-/DNS-safe host or short name.
     [[ "$server" =~ ^[A-Za-z0-9._-]{1,63}$ ]] || return 1
-    # Share: 1..80 chars, letters/digits/space and a small set of safe
-    # punctuation. Reject anything that could corrupt the comma-joined
-    # target list or smuggle additional path components.
     (( ${#share} >= 1 && ${#share} <= 80 )) || return 1
-    [[ "$share" == *","* ]]   && return 1
-    [[ "$share" == *"\\"* ]]  && return 1
+    [[ "$share" == *","* || "$share" == *"\\"* ]] && return 1
     [[ "$share" =~ ^[A-Za-z0-9._\$\ \&\(\)-]+$ ]] || return 1
     return 0
 }
