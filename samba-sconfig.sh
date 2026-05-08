@@ -314,40 +314,80 @@ menu_system_config() {
 }
 
 config_hostname() {
-    local current_fqdn
-    current_fqdn=$(get_fqdn)
+    # Hostname changes after a provision/join break Kerberos keytabs,
+    # machine account, SPNs, and replication identity. Block them and
+    # send the operator to Domain Operations to demote first.
+    if is_provisioned; then
+        info "This DC is already provisioned/joined.\n\nChanging the hostname here would break Kerberos, the machine account, and replication. To rename, demote first via Domain Operations, set the new hostname, then re-provision or re-join."
+        return
+    fi
 
-    local new_hostname
-    new_hostname=$(whiptail --inputbox \
-        "Enter the FQDN for this server.\n\nRules:\n- Short name max 15 characters (AD limit)\n- Use .lan or a subdomain you own\n- NEVER use .local (mDNS conflict)\n\nCurrent: $current_fqdn" \
-        14 64 "$current_fqdn" \
+    local cur_short cur_domain
+    cur_short=$(hostname -s 2>/dev/null || hostname)
+    cur_domain=$(dnsdomainname 2>/dev/null || true)
+
+    # Live-detect the default domain. Order:
+    #   1. DHCP search domain (resolvectl) — what the network just told us.
+    #   2. Reverse-DNS domain for our IP — second-best signal.
+    #   3. The current dnsdomainname — last resort, may itself be stale.
+    # The previous behavior pre-filled with the FULL current FQDN, which
+    # baked stale realms (e.g. 'lab.test' from a long-gone join) into
+    # every subsequent prompt.
+    local default_domain=""
+    default_domain=$(resolvectl domain 2>/dev/null \
+        | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) {
+                                gsub(/^~/,"",$i)
+                                if ($i!="" && $i!=".") {print $i; exit}
+                              }}')
+    if [[ -z "$default_domain" ]]; then
+        local ip_only
+        ip_only=$(get_ip | cut -d/ -f1)
+        if [[ -n "$ip_only" ]]; then
+            local ptr
+            ptr=$(timeout 5 dig +short -x "$ip_only" 2>/dev/null \
+                    | awk 'NR==1 {sub(/\.$/,""); print}')
+            if [[ -n "$ptr" && "$ptr" == *.* ]]; then
+                default_domain="${ptr#*.}"
+            fi
+        fi
+    fi
+    [[ -z "$default_domain" ]] && default_domain="$cur_domain"
+
+    local new_short
+    new_short=$(whiptail --inputbox \
+        "New hostname (SHORT name only — domain part is derived).\n\nNetBIOS limit: 15 chars, must start with a letter,\nallowed chars [A-Za-z0-9-].\n\nCurrent: ${cur_short}\nDomain (auto): ${default_domain:-<none>}" \
+        15 70 "$cur_short" \
         3>&1 1>&2 2>&3) || return
-
-    [[ -z "$new_hostname" ]] && return
-
-    if [[ "$new_hostname" != *.* ]]; then
-        info "ERROR: Must be a FQDN (e.g., dc1.home.lan)."; return
+    [[ -n "$new_short" ]] || return
+    if ! [[ "$new_short" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ ]]; then
+        info "ERROR: must start with a letter, [A-Za-z0-9-] only, 1-15 chars (NetBIOS limit)."
+        return
     fi
-    if [[ "$new_hostname" == *.local ]]; then
-        info "ERROR: .local conflicts with mDNS/Bonjour."; return
+    if [[ "$default_domain" == *.local ]]; then
+        info "ERROR: detected domain '${default_domain}' ends in .local which conflicts with mDNS.\nFix the network's DHCP/PTR domain first."
+        return
     fi
 
-    local short_name="${new_hostname%%.*}"
-    if [[ ${#short_name} -gt 15 ]]; then
-        info "ERROR: Short name '$short_name' exceeds 15 chars."; return
-    fi
+    local new_fqdn="$new_short"
+    [[ -n "$default_domain" ]] && new_fqdn="${new_short}.${default_domain}"
 
     local ip_addr
     ip_addr=$(get_ip | cut -d/ -f1)
 
-    hostnamectl set-hostname "$new_hostname"
-    echo "$new_hostname" > /etc/hostname
+    hostnamectl set-hostname "$new_fqdn"
+    echo "$new_fqdn" > /etc/hostname
 
-    # Clean /etc/hosts and add new entry
-    sed -i "/\s${current_fqdn}\b/d" /etc/hosts 2>/dev/null || true
-    echo "${ip_addr}  ${new_hostname}  ${short_name}" >> /etc/hosts
+    # Refresh /etc/hosts. Drop any prior entry for our IP or our old
+    # short name, then add the canonical line.
+    [[ -n "$ip_addr" ]] && sed -i "/^${ip_addr}[[:space:]]/d" /etc/hosts 2>/dev/null || true
+    sed -i "/[[:space:]]${cur_short}\([[:space:]]\|\$\)/d" /etc/hosts 2>/dev/null || true
+    if [[ -n "$default_domain" && -n "$ip_addr" ]]; then
+        echo "${ip_addr}  ${new_fqdn}  ${new_short}" >> /etc/hosts
+    elif [[ -n "$ip_addr" ]]; then
+        echo "${ip_addr}  ${new_short}" >> /etc/hosts
+    fi
 
-    info "Hostname set to: $new_hostname\nShort: $short_name\n\nReboot recommended."
+    info "Hostname set to: ${new_fqdn}\nShort: ${new_short}\n\nReboot recommended so all services pick it up."
 }
 
 get_addr_source() {
