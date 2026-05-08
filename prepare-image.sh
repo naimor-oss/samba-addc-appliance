@@ -1485,6 +1485,48 @@ load_detect_env() {
     DET_IP=$(ip -o -4 addr show scope global 2>/dev/null \
                 | awk 'NR==1 {sub(/\/.*$/,"",$4); print $4}')
     DET_GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+
+    # Live PTR refresh. samba-firstboot writes the cached file exactly
+    # once (its unit has ConditionPathExists=!/var/lib/samba-firstboot.done),
+    # so the cached PTR represents what DNS said the moment the appliance
+    # first booted with its default hostname. After the operator changes
+    # the hostname (or moves the VM to a different network), the cache
+    # goes stale and stays stuck on whatever the original PTR was —
+    # commonly the build-time `samba-dc1`. A 5s-bounded reverse lookup
+    # against the current IP keeps the wizard's "Detected PTR" hint and
+    # the hostname-prompt prefill in sync with reality.
+    #
+    # Empty live result keeps the cache (transient DNS flake or air-gapped
+    # network shouldn't blank the only signal we have). Non-empty live
+    # result wins outright — the operator changed something and wants to
+    # see it.
+    if [[ -n "$DET_IP" ]]; then
+        local live_ptr
+        live_ptr=$(timeout 5 dig +short -x "$DET_IP" 2>/dev/null \
+                    | awk 'NR==1 {sub(/\.$/,""); print}')
+        if [[ -n "$live_ptr" ]]; then
+            DET_PTR_FQDN="$live_ptr"
+            DET_PTR_NAME="${live_ptr%%.*}"
+            if [[ "$live_ptr" == *.* ]]; then
+                DET_PTR_DOMAIN="${live_ptr#*.}"
+            else
+                DET_PTR_DOMAIN=""
+            fi
+        fi
+    fi
+
+    # DHCP search-domain is also live-derivable from resolvectl. Same
+    # rule: live wins when set, fall back to cache.
+    local live_dhcp_domain
+    live_dhcp_domain=$(resolvectl domain 2>/dev/null \
+                | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) {
+                                          gsub(/^~/,"",$i)
+                                          if ($i!="" && $i!=".") {print $i; exit}
+                                      }}')
+    [[ -n "$live_dhcp_domain" ]] && DET_DHCP_DOMAIN="$live_dhcp_domain"
+
+    # Recompute the effective realm from whichever signal is current.
+    DET_EFFECTIVE_DOMAIN="${DET_DHCP_DOMAIN:-$DET_PTR_DOMAIN}"
 }
 
 count_upgrades() {
