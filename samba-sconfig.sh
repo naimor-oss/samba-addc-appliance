@@ -187,12 +187,19 @@ first_boot_wizard() {
 
     # 2. Updates
     if whiptail --title "System Updates" --yesno \
-        "Check for and install available updates now?\n\nThis runs 'apt update' and 'apt upgrade -y'. Takes 1-3 min on a clean image." 12 64; then
+        "Check for and install available updates now?\n\nThis runs 'apt update' and 'apt full-upgrade -y'. Full-upgrade is\nrequired so kernel metapackages (linux-image-cloud-amd64) actually\nget pulled — plain 'apt upgrade' silently keeps them back.\nTakes 1-3 min on a clean image." 14 70; then
         clear
         echo "[sconfig] apt update..."
         apt-get update
-        echo "[sconfig] apt upgrade..."
-        DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+        echo "[sconfig] apt full-upgrade..."
+        DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+        if [[ -f /var/run/reboot-required ]]; then
+            echo
+            echo "[sconfig] REBOOT REQUIRED — a kernel or library that's currently"
+            echo "[sconfig] loaded was upgraded. The first-boot wizard will reboot"
+            echo "[sconfig] for you after the rest of the wizard, or pick"
+            echo "[sconfig] 'Reboot / Shutdown' from the main menu later."
+        fi
         echo "[sconfig] done — press Enter to continue"
         read -r _
     fi
@@ -552,14 +559,27 @@ EOF
 }
 
 run_updates_now() {
-    if yesno "Run apt update && apt upgrade now?\n\nThis will update package lists and install available upgrades interactively."; then
+    if yesno "Run apt update && apt full-upgrade now?\n\nFull-upgrade is required to apply kernel metapackage updates\n(linux-image-cloud-amd64) — plain 'apt upgrade' silently keeps\nthem back. Runs interactively so you can review."; then
         clear
-        echo "=== Running system updates ==="
-        echo ""
+        echo "[sconfig] apt update..."
         apt-get update
-        echo ""
-        apt-get upgrade
-        echo ""
+        echo
+        echo "[sconfig] apt full-upgrade..."
+        echo "[sconfig]   note: full-upgrade can install new dependencies"
+        echo "[sconfig]   (e.g. new kernel ABI). Plain 'apt-get upgrade'"
+        echo "[sconfig]   would silently keep them back."
+        echo
+        apt-get full-upgrade
+        echo
+        echo "=============================================================="
+        if [[ -f /var/run/reboot-required ]]; then
+            echo "  REBOOT REQUIRED — a kernel or library that's currently"
+            echo "  loaded was upgraded. Pick 'Reboot / Shutdown' from the"
+            echo "  main menu (or run 'sudo reboot') to apply."
+        else
+            echo "  Done. No reboot required."
+        fi
+        echo "=============================================================="
         echo "Press Enter to return to samba-sconfig..."
         read -r
     fi

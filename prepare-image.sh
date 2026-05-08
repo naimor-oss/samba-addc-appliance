@@ -1748,15 +1748,31 @@ BAN
     fi
     [[ -f "$DEFAULT_PWD_MARKER" ]] && \
         echo "  Default password ACTIVE — change before remote use"
+    [[ -f /var/run/reboot-required ]] && \
+        echo "  REBOOT REQUIRED — pick [R] to apply pending kernel/library upgrades"
     echo "=============================================================="
 }
 
 action_update() {
     clear
-    echo "Refreshing apt indexes and applying upgrades..."
-    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+    echo "Refreshing apt indexes and applying upgrades (full-upgrade)..."
+    echo "Note: full-upgrade can install new dependencies (kernels, etc.)."
+    echo "      Plain 'apt-get upgrade' would silently keep them back —"
+    echo "      Debian metapackages like linux-image-cloud-amd64 only"
+    echo "      pick up new kernel ABIs through full-upgrade."
     echo
-    echo "  Done. Press Enter."
+    sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
+    echo
+    echo "=============================================================="
+    if [[ -f /var/run/reboot-required ]]; then
+        echo "  REBOOT REQUIRED — a kernel or library that's currently"
+        echo "  loaded was upgraded. Pick [R] from the menu (or run"
+        echo "  'sudo reboot') to apply the new version."
+    else
+        echo "  Done. No reboot required."
+    fi
+    echo "=============================================================="
+    echo "  Press Enter to return to the menu."
     read -r _
 }
 
