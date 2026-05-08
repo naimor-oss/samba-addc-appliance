@@ -1255,14 +1255,22 @@ done
 if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
 elif apt-get update -qq >>"$LOGFILE" 2>&1; then
-    upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
-    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security' || true)
+    # Use --simulate to count what apt would ACTUALLY install. Plain
+    # `apt list --upgradable` includes phased-rollout packages (apt 2.x
+    # feature: held back per-machine until the rollout completes), and
+    # those keep showing as pending forever even after upgrade because
+    # they're never actually installed by full-upgrade. --simulate
+    # reflects what the operator can act on right now.
+    sim=$(apt-get --simulate -qq dist-upgrade 2>/dev/null) || sim=""
+    upg=$(grep -c '^Inst ' <<< "$sim" || true)
+    sec=$(grep -c '^Inst .*-security' <<< "$sim" || true)
+    upg="${upg:-0}"; sec="${sec:-0}"
     if [[ "$upg" -eq 0 ]]; then
         APT_FRESHNESS="apt: image is current (0 upgrades pending)"
     else
         # Kernel and other held-back packages require dist-upgrade (installs new
         # packages); plain upgrade refuses to do so and silently skips them.
-        if apt-get --simulate upgrade 2>/dev/null | grep -q "kept back"; then
+        if grep -q "kept back" <<< "$sim"; then
             apt_cmd="sudo apt-get dist-upgrade"
         else
             apt_cmd="sudo apt-get upgrade"
@@ -1533,10 +1541,21 @@ count_upgrades() {
     if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
         echo "0 0"; return
     fi
-    local upg sec
-    upg=$(apt list --upgradable 2>/dev/null | grep -cv '^Listing')
-    sec=$(apt list --upgradable 2>/dev/null | grep -c -- '-security')
-    echo "${upg} ${sec}"
+    # `apt list --upgradable` includes packages caught in a phased
+    # rollout (apt 2.x feature: a percentage of machines are held back
+    # until the rollout completes). After a successful full-upgrade,
+    # phased packages stay on the upgradable list permanently from this
+    # machine's perspective, so the operator sees a stale "N pending"
+    # banner that never clears no matter how many times they upgrade.
+    #
+    # `apt-get --simulate dist-upgrade` reports what apt would actually
+    # install RIGHT NOW — phased packages and other held-back items are
+    # excluded. That's the count the operator can act on.
+    local sim upg sec
+    sim=$(apt-get --simulate -qq dist-upgrade 2>/dev/null) || sim=""
+    upg=$(grep -c '^Inst ' <<< "$sim" || true)
+    sec=$(grep -c '^Inst .*-security' <<< "$sim" || true)
+    echo "${upg:-0} ${sec:-0}"
 }
 
 # ----------------------------------------------------------------------------
