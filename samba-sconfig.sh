@@ -1645,7 +1645,10 @@ _dfs_update_one_namespace() {
 
     local keep_file
     keep_file=$(mktemp)
-    trap 'rm -f "$keep_file"' RETURN
+    # Bash RETURN traps fire on EVERY enclosing function return (no `set -T`
+    # functrace here), so $keep_file would be out of scope when dfs_update
+    # itself returns — set -u would then trip. Guard with default expansion.
+    trap 'rm -f -- "${keep_file:-}"' RETURN
 
     # Walk records. LDIF groups attrs of one entry between successive
     # `dn:` lines (or a blank line at the end). We commit the record on

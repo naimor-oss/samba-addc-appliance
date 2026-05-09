@@ -128,11 +128,20 @@ run_scenario() {
     local attempt
     for attempt in 1 2 3 4 5 6 7 8; do
         local seen
+        # Compute base DN locally (Mac side) — this is a $() substitution
+        # with its own parsing context, so single-quoted awk needs no
+        # backslash escapes for " or $.
+        local base_dn
+        base_dn=$(echo "$SC_REALM" | tr '[:upper:]' '[:lower:]' \
+            | awk -F. '{for(i=1;i<=NF;i++) printf "%sDC=%s",(i>1?",":""),$i}')
+        # grep -c always emits a count (even 0) and exits non-zero on no
+        # match — `|| echo 0` here would append a SECOND "0", producing
+        # "0\n0" which trips [[ -ge ]] arithmetic. Use `|| true` instead.
         seen=$(ssh_vm "sudo ldbsearch -H /var/lib/samba/private/sam.ldb \
-                -b 'CN=${SC_DFS_NAMESPACE},CN=${SC_DFS_NAMESPACE},CN=Dfs-Configuration,CN=System,$(echo "$SC_REALM" | tr '[:upper:]' '[:lower:]' | awk -F. '{for(i=1;i<=NF;i++) printf \"%sDC=%s\",(i>1?\",\":\"\"),\$i}')' \
+                -b 'CN=${SC_DFS_NAMESPACE},CN=${SC_DFS_NAMESPACE},CN=Dfs-Configuration,CN=System,${base_dn}' \
                 -s sub '(objectClass=msDFS-Linkv2)' msDFS-LinkPathv2 2>/dev/null \
-                | grep -c 'NewFolder'" || echo 0)
-        if [[ "${seen:-0}" -ge 1 ]]; then break; fi
+                | grep -c 'NewFolder'" || true)
+        if [[ "${seen:-0}" =~ ^[0-9]+$ ]] && (( seen >= 1 )); then break; fi
         sleep 5
     done
 
@@ -143,6 +152,21 @@ run_scenario() {
 verify() {
     local rc=0 out
     local ns_dir="${SC_DFS_ROOT}/${SC_DFS_NAMESPACE}"
+
+    say "dfs-update produces no shell-runtime errors on stderr"
+    # Regression guard: under set -u or pipe-eating misuse, samba-sconfig
+    # would print "unbound variable" / arithmetic / syntax errors to stderr
+    # but still exit 0 because of how RETURN traps and `|| true` swallow
+    # errors. Capture full stderr from a fresh idempotent run and fail if
+    # any shell-runtime error markers appear.
+    out=$(ssh_vm "sudo samba-sconfig dfs-update 2>&1" || true)
+    if grep -E "unbound variable|arithmetic (syntax )?error|command not found|: line [0-9]+: " <<< "$out" >/dev/null; then
+        say "shell-runtime errors found in dfs-update output:"
+        grep -E "unbound variable|arithmetic (syntax )?error|command not found|: line [0-9]+: " <<< "$out" | sed 's/^/  /'
+        rc=1
+    else
+        echo "  clean stderr"
+    fi
 
     say "drop-in file is present and smb.conf includes it"
     out=$(ssh_vm "sudo cat /etc/samba/conf.d/dfs-root.conf 2>&1 && echo '---' && sudo grep 'include = /etc/samba/conf.d/dfs-root.conf' /etc/samba/smb.conf")
