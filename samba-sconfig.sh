@@ -228,24 +228,39 @@ first_boot_wizard() {
     if [[ "$addr_source" == "dhcp" ]]; then
         if whiptail --title "Network" --yesno \
             "Interface is on DHCP ($(get_ip | cut -d/ -f1)).\n\nAn AD DC needs a stable IP. Pin the current lease as static now?" 12 64; then
-            local iface; iface=$(get_iface)
-            local ip mask gw dns
-            ip=$(get_ip | cut -d/ -f1); mask=$(get_ip | cut -d/ -f2)
-            gw=$(get_gateway); dns=$(get_current_dns)
-            cat > /etc/network/interfaces << NETEOF
-# Managed by samba-sconfig (first-boot pin)
-auto lo
-iface lo inet loopback
-
-auto ${iface}
-iface ${iface} inet static
-    address ${ip}/${mask}
-    gateway ${gw}
-NETEOF
-            take_over_resolv_conf
-            printf "nameserver %s\n" "$dns" > /etc/resolv.conf
-            whiptail --title "Network" --msgbox \
-                "Static pin written:\n  ${ip}/${mask}\n  gw=${gw}  dns=${dns}\n\nEffective on next boot (or systemctl restart networking)." 12 64
+            # Delegate to appliance-core's netconfig.sh. The earlier
+            # implementation wrote /etc/network/interfaces — silently
+            # ignored on Debian 13 + systemd-networkd + netplan, so the
+            # operator's "pin static" click had no effect on real
+            # network state. Same fix as config_network() below.
+            if ! command -v appcore_netconfig_render_static >/dev/null 2>&1; then
+                whiptail --title "Network" --msgbox \
+                    "appliance-core netconfig lib not vendored on this image.\nSkipping the pin-static step. Configure the network from the\nmain menu after first-boot, or rebuild via lab/build-fresh-base.sh." \
+                    12 70
+            else
+                local ip mask gw dns ipcidr
+                ip=$(get_ip | cut -d/ -f1); mask=$(get_ip | cut -d/ -f2)
+                gw=$(get_gateway); dns=$(get_current_dns)
+                ipcidr="${ip}/${mask}"
+                # Use the same netplan path as config_network so
+                # subsequent changes target one file. 'e*' match
+                # mirrors what config_network passes today.
+                if appcore_netconfig_render_static \
+                        /etc/netplan/60-samba-init.yaml primary \
+                        'name: "e*"' "$ipcidr" "$gw" "$dns"; then
+                    local log
+                    log=$(mktemp -t samba-netplan.XXXXXX)
+                    if appcore_netconfig_apply "$log"; then
+                        appcore_tui_show_capture "Static pin applied" "$log"
+                    else
+                        appcore_tui_show_capture "netplan apply FAILED" "$log"
+                    fi
+                else
+                    whiptail --title "Network" --msgbox \
+                        "Pin failed validation. Check that DHCP lease values are sane:\n  ip=${ipcidr}  gw=${gw}  dns=${dns}" \
+                        12 70
+                fi
+            fi
         fi
     fi
 
@@ -874,19 +889,55 @@ domain_provision_new() {
     systemctl stop samba-ad-dc 2>/dev/null || true
     write_krb5_conf "$DC_REALM"
 
+    # Capture provision rc + the CLI's tail output to a temp file so we
+    # can branch the post-steps on success and surface the failure to the
+    # operator. The pipeline-with-tail-5 form swallowed the rc inside
+    # the gauge subshell — the wizard happily ran hardening and
+    # post_provision_setup against a half-provisioned tree, then said
+    # "Domain provisioned!" only because samba-ad-dc had been started
+    # by post_provision_setup against a non-empty sam.ldb the prior
+    # provision attempt left behind. The CLI form (cli_provision_inner)
+    # already does this right; this is the TUI catching up.
+    local prov_log prov_rc
+    prov_log=$(mktemp -t samba-provision.XXXXXX)
     {
         echo "10"; echo "XXX"; echo "Provisioning AD domain..."; echo "XXX"
         samba-tool domain provision \
             --realm="$DC_REALM" --domain="$DC_NETBIOS" \
             --server-role=dc --dns-backend=SAMBA_INTERNAL \
             --adminpass="$DC_ADMIN_PASS" \
-            --option="dns forwarder = $DC_DNS_FORWARDER" 2>&1 | tail -5
-        echo "50"; echo "XXX"; echo "Applying hardening..."; echo "XXX"
-        apply_hardening_to_smb_conf
-        echo "70"; echo "XXX"; echo "Starting services..."; echo "XXX"
-        post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
-        echo "100"; echo "XXX"; echo "Done!"; echo "XXX"
+            --option="dns forwarder = $DC_DNS_FORWARDER" \
+            >"$prov_log" 2>&1
+        printf '%d' "$?" > "${prov_log}.rc"
+        # Show only the tail of the log inside the gauge — keeps the
+        # high-bandwidth CLI noise from blowing up the dialog.
+        tail -5 "$prov_log"
+        if [[ "$(cat "${prov_log}.rc")" != "0" ]]; then
+            # Halt the gauge progression. We don't run hardening or
+            # post-setup against a failed provision tree.
+            echo "100"; echo "XXX"; echo "FAILED — see error after gauge."; echo "XXX"
+        else
+            echo "50"; echo "XXX"; echo "Applying hardening..."; echo "XXX"
+            apply_hardening_to_smb_conf
+            echo "70"; echo "XXX"; echo "Starting services..."; echo "XXX"
+            post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
+            echo "100"; echo "XXX"; echo "Done!"; echo "XXX"
+        fi
     } | whiptail --title "Provisioning" --gauge "Starting..." 8 60 0
+
+    prov_rc=$(cat "${prov_log}.rc" 2>/dev/null || echo "1")
+    if [[ "$prov_rc" != "0" ]]; then
+        # Surface the captured samba-tool output via the sized-textbox
+        # renderer so multi-line provisioning errors are readable.
+        if command -v appcore_tui_show_capture >/dev/null 2>&1; then
+            appcore_tui_show_capture "Provision FAILED (rc=$prov_rc)" "$prov_log"
+        else
+            info "Provision FAILED (rc=$prov_rc).\n\n$(tail -10 "$prov_log")\n\nCheck the full log: $prov_log"
+        fi
+        rm -f "${prov_log}.rc"
+        return 1
+    fi
+    rm -f "$prov_log" "${prov_log}.rc"
 
     if is_addc_running; then
         info "Domain provisioned!\n\nRealm: $DC_REALM | NetBIOS: $DC_NETBIOS\n\nNext: Run Diagnostics (6), Post-Domain Setup (3), Hardening (5)"
@@ -1505,6 +1556,23 @@ _dfs_remove_drop_in() {
 # everything we don't need.
 _dfs_install_units() {
     local interval="$1"
+    # Resolve the runtime DFS root from $DFS_CONF if it exists. The unit
+    # used to hardcode ReadWritePaths=$DFS_DEFAULT_ROOT, which combined
+    # with ProtectSystem=strict made scheduled updates fail silently
+    # whenever dfs-init was given a custom --root path. cli_dfs_init
+    # accepts a custom root, but the unit was rendered against the
+    # default — so the timer ran but every write got EROFS. Re-render
+    # against the live DFS_ROOT here so scheduling and provisioning
+    # agree on the same path.
+    local rwroot="$DFS_DEFAULT_ROOT"
+    if [[ -f "$DFS_CONF" ]]; then
+        # Read DFS_ROOT in a subshell so we don't leak the var into the
+        # outer scope.
+        local conf_root
+        # shellcheck disable=SC1090
+        conf_root=$( source "$DFS_CONF"; printf '%s' "${DFS_ROOT:-}" )
+        [[ -n "$conf_root" ]] && rwroot="$conf_root"
+    fi
     cat > "$DFS_UNIT" <<UNITEOF
 [Unit]
 Description=Samba DFS-N namespace symlink updater
@@ -1521,7 +1589,7 @@ ProtectSystem=strict
 ProtectHome=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
-ReadWritePaths=${DFS_DEFAULT_ROOT} /run /var/log/samba
+ReadWritePaths=${rwroot} /run /var/log/samba
 ReadOnlyPaths=/var/lib/samba
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes

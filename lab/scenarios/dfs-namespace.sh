@@ -256,6 +256,27 @@ verify() {
     echo "  timer: $out"
     [[ "$out" == "active" ]] || { say "timer not active"; rc=1; }
 
+    # ReadWritePaths in the rendered unit MUST include the runtime
+    # DFS_ROOT, not just the compile-time default. ProtectSystem=strict
+    # makes the timer write fall over EROFS otherwise. Custom-root case
+    # was the original regression; pin by reading both the conf-file
+    # value and the unit-file value, then confirming the unit covers
+    # the runtime root.
+    out=$(ssh_vm '
+        set -e
+        runtime_root=$( . /etc/samba/dfs-update.conf 2>/dev/null; printf "%s" "${DFS_ROOT:-}" )
+        rwpaths=$(grep -E "^ReadWritePaths=" /etc/systemd/system/samba-dfs-update.service)
+        printf "runtime_root=%s\n" "$runtime_root"
+        printf "rwpaths=%s\n" "$rwpaths"
+    ' 2>&1 || true)
+    echo "$out" | sed 's/^/  /'
+    runtime_root=$(grep '^runtime_root=' <<< "$out" | cut -d= -f2-)
+    rwpaths=$(grep '^rwpaths=' <<< "$out" | cut -d= -f2-)
+    if [[ -n "$runtime_root" ]] && ! grep -qF "$runtime_root" <<< "$rwpaths"; then
+        say "ReadWritePaths='$rwpaths' does NOT cover runtime DFS_ROOT='$runtime_root'"
+        rc=1
+    fi
+
     return $rc
 }
 
