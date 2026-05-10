@@ -277,6 +277,34 @@ verify() {
         rc=1
     fi
 
+    # DFS-N.md §8 protocol: assert each hardening directive landed in
+    # the rendered unit. Catches a refactor that drops one — the unit
+    # would still boot the timer happily, but the security posture
+    # documented in the design doc would silently regress.
+    say "rendered service unit carries the §8 hardening directives"
+    out=$(ssh_vm 'sudo cat /etc/systemd/system/samba-dfs-update.service' 2>&1 || true)
+    local _h
+    for _h in \
+        '^ProtectSystem=strict$' \
+        '^ProtectHome=yes$' \
+        '^NoNewPrivileges=yes$' \
+        '^PrivateTmp=yes$' \
+        '^ReadOnlyPaths=/var/lib/samba$' \
+        '^RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6$' \
+        '^LockPersonality=yes$' \
+        '^MemoryDenyWriteExecute=yes$'; do
+        if ! grep -qE "$_h" <<< "$out"; then
+            say "service unit missing required directive: $_h"
+            rc=1
+        fi
+    done
+
+    say "rendered timer unit carries the §8 timer settings"
+    out=$(ssh_vm 'sudo cat /etc/systemd/system/samba-dfs-update.timer' 2>&1 || true)
+    grep -qE '^Persistent=true$'           <<< "$out" || { say "timer Persistent=true missing"; rc=1; }
+    grep -qE '^RandomizedDelaySec='        <<< "$out" || { say "timer RandomizedDelaySec missing"; rc=1; }
+    grep -qE '^OnUnitActiveSec='           <<< "$out" || { say "timer OnUnitActiveSec missing"; rc=1; }
+
     return $rc
 }
 

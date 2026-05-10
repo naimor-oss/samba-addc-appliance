@@ -224,10 +224,12 @@ arguments (or reads them from a config file written by
    - **Anything else (regular file, foreign symlink, non-empty
      dir we didn't put there) → leave alone and log a warning.**
    The tool never deletes things it didn't create.
-10. **Reload Samba**: `smbcontrol smbd reload-config`. This is
-    sufficient for adding a share section in modern Samba.
-    `systemctl reload samba-ad-dc` is reserved for `[global]`
-    edits.
+10. **Reload Samba**: `smbcontrol all reload-config`. This is
+    sufficient for adding a share section in modern Samba; we use
+    `all` rather than `smbd` so winbind also picks up changes
+    relevant to its mappings (cheap insurance, no downside vs.
+    targeting smbd alone). `systemctl reload samba-ad-dc` is
+    reserved for `[global]` edits.
 
 ## 7. Adversarial input handling
 
@@ -296,12 +298,21 @@ ProtectSystem=strict
 ProtectHome=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
-ReadWritePaths=/srv/samba/dfs_root /run /var/log/samba
+ReadWritePaths=${DFS_ROOT} /run /var/log/samba
 ReadOnlyPaths=/var/lib/samba
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 ```
+
+`ReadWritePaths` is rendered against the runtime `$DFS_ROOT` (read
+from `/etc/samba/dfs-update.conf` if a custom `--root` was passed
+to `dfs-init`, otherwise the compile-time default
+`/srv/samba/dfs_root`). The unit was previously hardcoded to the
+default, which under `ProtectSystem=strict` made scheduled updates
+fail silently with EROFS whenever a custom root was in use; the
+fix landed in commit `be6f1a6` and the `dfs-namespace` scenario
+asserts the rendered path covers the runtime root.
 
 Timer: `/etc/systemd/system/samba-dfs-update.timer`
 
@@ -440,9 +451,16 @@ regression tests.
 
 ## 11. Open questions / followups
 
-- **Multi-namespace support**: first cut handles N namespaces by
-  config; cross-namespace conflicts (two namespaces wanting the
-  same share name) fail loudly at init.
+- **Multi-namespace support**: today `dfs-init` writes one drop-in
+  per `(SHARE, ROOT)` pair and `dfs-configure` accepts N
+  namespaces under a single root. Cross-namespace share-name
+  conflict detection (two operators trying to host different
+  namespaces under the same `[share]`) is **not yet enforced** —
+  the second `dfs-init` would silently overwrite the drop-in.
+  When a second namespace becomes a real consumer, add an init-
+  time refusal that reads the existing drop-in and rejects on
+  share-name reuse with a different root, or root reuse with a
+  different share. Until then the operator is the safety net.
 - **TTL handling**: `msDFS-Ttlv2` per link could feed
   `dfs:referral_ttl` style hints, but Samba doesn't expose a
   per-symlink TTL knob; the namespace-wide TTL is what the client

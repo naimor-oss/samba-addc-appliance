@@ -35,7 +35,72 @@ The generic pipeline (from `lab-kit`) is:
 7. `post_hook`.
 8. Transcript is written to `test-results/<scenario>-<timestamp>.log`.
 
-## Existing Scenario
+## Existing Scenarios
+
+The implemented scenarios cover the full join + provision + DFS path
+plus a smoke gate and two recovery cases:
+
+```text
+smoke-prepared-image (gate before any other scenario)
+provision-new          (new-forest path)
+join-dc                (additional-DC path; current default)
+dfs-namespace          (DFS-N convergence; depends on join-dc)
+sysvol-sync-stale-then-pull  (recovery)
+ws2025-down-resilience       (resilience)
+```
+
+### `smoke-prepared-image`
+
+Purpose: verify the golden image is a clean appliance base before
+any domain operation runs. Same role smoke plays for every other
+appliance — fail fast on a bad base instead of mis-attributing a
+later scenario failure.
+
+What it covers:
+
+- `samba-sconfig` is installed and executable.
+- `samba-ad-dc` is disabled/inactive.
+- `smbd`, `nmbd`, and `winbind` are masked or inactive as intended.
+- `/etc/samba/smb.conf` does not exist.
+- `pwsh`, `nft`, `ldapsearch`, `smbclient`, `samba-tool`, `chronyd`,
+  and `dig` exist.
+- Kerberos and chrony are deployment-neutral skeletons.
+- Network is alive through the lab router.
+- The first-launch marker has not been consumed.
+
+Run:
+
+```bash
+lab/run-scenario.sh smoke-prepared-image
+```
+
+### `provision-new`
+
+Purpose: verify Samba can be the first DC in a new forest, not only
+a joined DC. Drives `samba-sconfig provision-new` (the headless
+counterpart of the TUI's *Create New Forest* path).
+
+What it covers:
+
+- `samba-tool domain provision` succeeds end-to-end.
+- `samba-ad-dc` starts and stays active.
+- DNS SRV records exist locally (`_ldap._tcp.<realm>` etc.).
+- Kerberos TGT acquisition works (`kinit Administrator@<REALM>`).
+- SYSVOL and NETLOGON shares are available.
+- chrony is configured against the appliance itself as time source.
+- The hardening block is inserted into `[global]`, not into a share
+  section.
+- TLS certificate has DNS and IP SAN entries.
+- The TUI provision rc capture (commit `be6f1a6`) ensures a failed
+  `samba-tool domain provision` halts the gauge and surfaces the
+  error instead of running hardening + post-setup against a
+  half-provisioned tree.
+
+Run:
+
+```bash
+lab/run-scenario.sh provision-new
+```
 
 ### `join-dc`
 
@@ -124,53 +189,41 @@ and `New-DfsnRootTarget` validates target reachability. Tertiary-
 priority registration is a deployment-time concern, not part of the
 test surface.
 
+### `sysvol-sync-stale-then-pull`
+
+Purpose: recovery scenario. The Samba DC has no DFSR, so SYSVOL
+content is kept in sync via an out-of-band SMB pull. This scenario
+deliberately makes SYSVOL stale and proves the configured pull
+brings it back into agreement with the WS2025 source. Lives in
+the gate as a soft regression test rather than a green-field
+build path.
+
+Run:
+
+```bash
+lab/run-scenario.sh sysvol-sync-stale-then-pull
+```
+
+### `ws2025-down-resilience`
+
+Purpose: prove the Samba DC continues to serve known clients when
+WS2025-DC1 is unavailable (PDC outage, planned maintenance, link
+failure). Authoritative for the "is this DC actually useful when
+the Windows side blinks" question.
+
+Run:
+
+```bash
+lab/run-scenario.sh ws2025-down-resilience
+```
+
 ## Important Tests To Add
 
-The following tests are the highest-value next additions. They are written in
-the order they should be implemented.
+The following tests are the highest-value next additions. They are
+written in the order they should be implemented. Implemented ones
+were promoted to *Existing Scenarios* above.
 
-### 1. Smoke Test: `smoke-prepared-image`
-
-Purpose: verify the golden image is still a clean appliance base before any
-domain operation.
-
-Assertions:
-
-- `samba-sconfig` is installed and executable.
-- `samba-ad-dc` is disabled/inactive.
-- `smbd`, `nmbd`, and `winbind` are masked or inactive as intended.
-- `/etc/samba/smb.conf` does not exist.
-- `pwsh`, `nft`, `ldapsearch`, `smbclient`, `samba-tool`, and `chronyd` exist.
-- chrony has no hard-coded internet pools before deployment.
-- `/etc/krb5.conf` is the skeleton.
-- DNS and internet connectivity work through `router1`.
-- first-boot marker behavior is predictable.
-
-Why it matters: failed joins are much easier to debug when the base image is
-known-good and deliberately unprovisioned.
-
-Status: implemented in `lab/scenarios/smoke-prepared-image.sh`.
-
-### 2. New Forest Provision: `provision-new-forest`
-
-Purpose: verify Samba can be the first DC in a new forest, not only a joined DC.
-
-Assertions:
-
-- `samba-tool domain provision` succeeds through the appliance flow.
-- `samba-ad-dc` starts and stays active.
-- DNS SRV records exist locally.
-- Kerberos TGT acquisition works.
-- SYSVOL and NETLOGON shares are available.
-- chrony is configured as the domain time source.
-- hardening block is inserted into `[global]`, not a share section.
-- TLS certificate has DNS and IP SAN entries.
-- firewall can be enabled without blocking AD ports.
-
-Needed script support: add a headless `samba-sconfig provision` command or keep
-this as a TUI/manual test until that exists.
-
-### 3. RODC Join: `join-rodc`
+### 1. RODC Join: `join-rodc`
 
 Purpose: verify the RODC path stays healthy as code changes.
 
@@ -186,7 +239,7 @@ Assertions:
 Why it matters: RODC joins are similar enough to writable joins to accidentally
 reuse broken assumptions, but different enough to deserve their own regression.
 
-### 4. Hardening Compatibility: `hardening-ws2025`
+### 2. Hardening Compatibility: `hardening-ws2025`
 
 Purpose: prove the appliance remains compatible with WS2025 security posture.
 
@@ -203,7 +256,7 @@ Assertions:
 Why it matters: hardening regressions often look like client compatibility
 issues unless tested explicitly.
 
-### 5. SYSVOL Sync: `sysvol-sync-smb`
+### 3. SYSVOL Sync: `sysvol-sync-smb`
 
 Purpose: prove the out-of-band SYSVOL workaround remains operational.
 
@@ -219,7 +272,7 @@ Assertions:
 
 Why it matters: Samba has no DFSR, so this is not optional operational glue.
 
-### 6. DNS Reverse Zone Edge Cases: `join-no-reverse-zone`
+### 4. DNS Reverse Zone Edge Cases: `join-no-reverse-zone`
 
 Purpose: verify the join path gives useful output when a reverse zone is absent.
 
@@ -233,7 +286,7 @@ Assertions:
 Why it matters: many real AD environments do not have every reverse zone
 created ahead of time.
 
-### 7. Second Samba DC: `join-samba-to-samba`
+### 5. Second Samba DC: `join-samba-to-samba`
 
 Purpose: verify Samba-to-Samba behavior and SSH-based SYSVOL sync.
 
@@ -247,7 +300,7 @@ Assertions:
 Why it matters: Windows interop and Samba-only topologies exercise different
 paths.
 
-### 8. Upgrade Safety: `manual-upgrade-policy`
+### 6. Upgrade Safety: `manual-upgrade-policy`
 
 Purpose: ensure update policy does not accidentally upgrade Samba unattended.
 
@@ -325,13 +378,26 @@ pattern is:
 - Print progress lines prefixed with `[sconfig]`.
 - Return non-zero only for failures the test should treat as scenario failure.
 
-Good candidates:
+Existing headless subcommands (the patterns above are already in
+place; reuse them):
 
-- `samba-sconfig provision`
-- `samba-sconfig harden`
-- `samba-sconfig enable-firewall`
+- `samba-sconfig provision-new` — new-forest provision (used by
+  `provision-new` scenario)
+- `samba-sconfig join-dc` — additional-DC join (used by `join-dc`
+  scenario)
+- `samba-sconfig dfs-init` / `dfs-configure` / `dfs-update` /
+  `dfs-schedule` / `dfs-status` / `dfs-remove` — DFS-N command
+  family (used by `dfs-namespace`)
+- `samba-sconfig diag` — multi-section diagnostics (`net ads info`,
+  `samba-tool drs showrepl`, etc.)
+
+Good candidates for new headless subcommands:
+
+- `samba-sconfig harden` — explicit hardening pass (currently runs
+  inline as part of `provision-new` / `join-dc`)
+- `samba-sconfig enable-firewall` — separate from provision/join so
+  scenarios can toggle the firewall in isolation
 - `samba-sconfig sysvol-sync configure-smb`
-- `samba-sconfig sanity`
 
 ## Test Data Hygiene
 
