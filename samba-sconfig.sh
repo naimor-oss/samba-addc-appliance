@@ -2221,6 +2221,7 @@ test_smb() {
 
 show_domain_info() {
     is_provisioned || { info "Not provisioned."; return; }
+    # shellcheck disable=SC2155  # samba-tool's rc is informational here, not load-bearing
     local out="=== Domain ===\n\n$(samba-tool domain level show 2>&1)\n\nFSMO:\n$(samba-tool fsmo show 2>&1)\n"
     whiptail --title "Domain Info" --scrolltext --msgbox "$out" 24 76
 }

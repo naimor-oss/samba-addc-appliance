@@ -156,6 +156,7 @@ if [[ ! -f "$OUT_VHDX" ]]; then
     echo "-> converting qcow2 -> vhdx (~60s)"
     tmp_qcow=$(mktemp /tmp/samba-base-XXXX.qcow2)
     tmp_vhdx=$(mktemp /tmp/samba-base-XXXX.vhdx)
+    # shellcheck disable=SC2064  # tmp_qcow/tmp_vhdx are mktemp paths set above; expand-now is intentional
     trap "rm -f '$tmp_qcow' '$tmp_vhdx'" EXIT
     cp "$CACHE_QCOW2" "$tmp_qcow"
     qemu-img convert -O vhdx -o subformat=dynamic "$tmp_qcow" "$tmp_vhdx"
