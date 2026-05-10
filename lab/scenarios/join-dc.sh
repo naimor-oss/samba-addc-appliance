@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/join-dc.sh — join samba-dc1 to the WS2025 lab forest as
 # an additional writable DC.
 #

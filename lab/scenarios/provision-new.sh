@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/provision-new.sh — provision a brand-new forest, no Windows
 # DC dependency. Validates the standalone path that's normally exercised by
 # hand only.

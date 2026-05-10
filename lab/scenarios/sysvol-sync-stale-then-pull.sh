@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/sysvol-sync-stale-then-pull.sh — exercise the version-aware
 # SYSVOL puller's recovery path: hand-stale a GPO on samba-dc1, run
 # /usr/local/sbin/sysvol-sync, assert the GPO converges back to its AD-known

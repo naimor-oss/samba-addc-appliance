@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/dfs-namespace.sh — exercise the DFS-N tertiary namespace
 # server: join the lab forest, set up a v2 namespace on WS2025-DC1 with
 # adversarial folder names + a malformed link injected via raw LDAP, run

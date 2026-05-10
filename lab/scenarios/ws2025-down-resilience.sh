@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # lab/scenarios/ws2025-down-resilience.sh — verify samba-dc1 stays
 # operational when WS2025-DC1 is offline (the "≤5-day Win-DC outage"
 # constraint baked into the appliance design).
