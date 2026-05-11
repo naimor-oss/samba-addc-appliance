@@ -2058,14 +2058,119 @@ apply_ws2025_hardening() {
         info "WARNING: Service failed. Check journalctl -u samba-ad-dc"
 }
 
+# is_dfs_enabled — returns 0 if DFS-N is configured AND active on
+# this host. Three load-bearing artifacts together:
+#   - the drop-in include file ($DFS_INCLUDE_FILE) exists, so smb.conf
+#     actually advertises the namespace share
+#   - the global sentinel ($DFS_DEFAULT_ROOT/$DFS_SENTINEL_NAME OR
+#     the runtime-configured $DFS_ROOT/$DFS_SENTINEL_NAME) exists, so
+#     dfs-update will operate (not refuse)
+#   - the systemd unit file ($DFS_UNIT) is in place
+# Any one missing = not enabled. Used by enable_firewall to render
+# the DFS-N awareness section of the nftables ruleset, and by
+# cli_dfs_status to report firewall alignment.
+is_dfs_enabled() {
+    [[ -f "$DFS_INCLUDE_FILE" ]] || return 1
+    [[ -f "$DFS_UNIT" ]] || return 1
+    local dfs_root="$DFS_DEFAULT_ROOT"
+    if [[ -f "$DFS_CONF" ]]; then
+        local conf_root
+        # shellcheck disable=SC1090
+        conf_root=$( source "$DFS_CONF"; printf '%s' "${DFS_ROOT:-}" )
+        [[ -n "$conf_root" ]] && dfs_root="$conf_root"
+    fi
+    [[ -f "${dfs_root}/${DFS_SENTINEL_NAME}" ]] || return 1
+    return 0
+}
+
+# Render the nftables ruleset based on the host's current state. The
+# port list is identical with-or-without DFS-N because DFS-N referrals
+# travel over the SMB session (445/tcp) that's already open on every
+# AD DC. What changes is the HEADER comment, which records the
+# DFS-N state inline in the ruleset so an operator listing the ruleset
+# (`nft list ruleset`) can confirm at a glance that the firewall +
+# DFS-N posture agree.
+#
+# Stdin: none. Stdout: the rendered ruleset.
+#
+# Argument $1: "dfs-enabled" or "no-dfs" (avoids re-querying state in
+# tests so the rendering is unit-testable.)
+_render_addc_firewall_ruleset() {
+    local dfs_state="${1:-no-dfs}"
+    local dfs_header
+    if [[ "$dfs_state" == "dfs-enabled" ]]; then
+        dfs_header="# DFS-N namespace server: ENABLED
+#   Referrals travel over 445/tcp (accepted below). No additional
+#   inbound ports are required — the Samba msdfs root path operates
+#   inline within the existing SMB session. The Windows DFS
+#   Management Service is NOT hosted; remote DFS-N admin from a
+#   Windows console is unavailable against this DC by design."
+    else
+        dfs_header="# DFS-N namespace server: NOT HOSTED
+#   If you later run 'samba-sconfig dfs-init', re-run
+#   'samba-sconfig enable-firewall' so the ruleset header reflects
+#   that. The active port list does not change either way."
+    fi
+
+    cat <<NFTHEAD
+#!/usr/sbin/nft -f
+#
+# AD DC firewall ruleset, rendered by samba-sconfig enable-firewall.
+# Re-render any time DFS-N state changes.
+#
+$dfs_header
+#
+flush ruleset
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
+        iif "lo" accept
+        ct state established,related accept
+        ip protocol icmp accept
+        ip6 nexthdr ipv6-icmp accept
+        tcp dport 22 accept                       # ssh
+        tcp dport 53 accept                       # DNS
+        udp dport 53 accept                       # DNS
+        tcp dport 88 accept                       # Kerberos
+        udp dport 88 accept                       # Kerberos
+        udp dport 123 accept                      # NTP
+        tcp dport 135 accept                      # RPC endpoint mapper
+        tcp dport 139 accept                      # NetBIOS session (legacy)
+        tcp dport 389 accept                      # LDAP
+        udp dport 389 accept                      # LDAP
+        tcp dport 445 accept                      # SMB (incl. DFS-N referrals when hosted)
+        tcp dport 464 accept                      # kpasswd
+        udp dport 464 accept                      # kpasswd
+        tcp dport 636 accept                      # LDAPS
+        tcp dport { 3268, 3269 } accept           # Global Catalog
+        tcp dport 49152-65535 accept              # ephemeral RPC
+        log prefix "nft-drop: " limit rate 5/minute
+        drop
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output  { type filter hook output priority 0; policy accept; }
+}
+NFTHEAD
+}
+
 enable_firewall() {
-    [[ -f /etc/nftables-samba-addc.conf ]] || { info "Ruleset not found. Re-run prepare-image.sh."; return; }
     yesno "Enable AD DC firewall?\nOnly AD ports + SSH will be open." || return
 
-    cp /etc/nftables-samba-addc.conf /etc/nftables.conf
+    local dfs_state="no-dfs"
+    if is_dfs_enabled; then
+        dfs_state="dfs-enabled"
+    fi
+
+    _render_addc_firewall_ruleset "$dfs_state" > /etc/nftables.conf
+    chmod 0644 /etc/nftables.conf
     systemctl enable nftables
     nft -f /etc/nftables.conf
-    info "Firewall enabled. Verify: nft list ruleset"
+
+    if [[ "$dfs_state" == "dfs-enabled" ]]; then
+        info "Firewall enabled (DFS-N namespace server: ENABLED).\nVerify: nft list ruleset"
+    else
+        info "Firewall enabled (no DFS-N hosted).\nVerify: nft list ruleset"
+    fi
 }
 
 disable_firewall() {
@@ -2459,6 +2564,13 @@ CONFEOF
     fi
     smbcontrol all reload-config 2>/dev/null || true
     echo "[dfs-init] done. Configure namespaces with: samba-sconfig dfs-configure NS1 [NS2 ...]"
+    # Nudge the operator to refresh the firewall ruleset header so it
+    # records "DFS-N: ENABLED". The active port list does not change;
+    # this is operator-clarity only. Skipped if the firewall isn't
+    # enabled to begin with.
+    if [[ -f /etc/nftables.conf ]] && ! grep -qF "DFS-N namespace server: ENABLED" /etc/nftables.conf; then
+        echo "[dfs-init] firewall ruleset is not yet marked DFS-aware; re-run 'samba-sconfig enable-firewall' to refresh it."
+    fi
 }
 
 cli_dfs_init() {
@@ -2525,6 +2637,29 @@ cli_dfs_status() {
     _s=$(systemctl is-active samba-dfs-update.service 2>/dev/null)
     echo "Timer:      ${_t:-unknown}"
     echo "Service:    ${_s:-unknown}"
+    # Firewall alignment: report whether the rendered nftables ruleset
+    # header records the current DFS-N state. An operator who runs
+    # dfs-init or dfs-remove without re-running enable-firewall would
+    # see "drift" here, prompting them to re-render.
+    if [[ -f /etc/nftables.conf ]]; then
+        local fw_state="not-DFS-aware"
+        if grep -qF "DFS-N namespace server: ENABLED" /etc/nftables.conf; then
+            fw_state="dfs-enabled"
+        elif grep -qF "DFS-N namespace server: NOT HOSTED" /etc/nftables.conf; then
+            fw_state="no-dfs"
+        fi
+        local dfs_state="no-dfs"
+        is_dfs_enabled && dfs_state="dfs-enabled"
+        if [[ "$fw_state" == "$dfs_state" ]]; then
+            echo "Firewall:   in-sync ($fw_state)"
+        elif [[ "$fw_state" == "not-DFS-aware" ]]; then
+            echo "Firewall:   not DFS-aware — re-run 'samba-sconfig enable-firewall' to refresh header"
+        else
+            echo "Firewall:   DRIFT (ruleset=$fw_state, runtime=$dfs_state) — re-run 'samba-sconfig enable-firewall'"
+        fi
+    else
+        echo "Firewall:   /etc/nftables.conf absent (firewall not enabled)"
+    fi
     if [[ -f "$DFS_LOG" ]]; then
         echo
         echo "--- last 12 log lines ---"
@@ -2544,6 +2679,9 @@ cli_dfs_remove() {
     smbcontrol all reload-config 2>/dev/null || true
     echo "[dfs-remove] units, drop-in, and config removed."
     echo "[dfs-remove] filesystem under ${DFS_DEFAULT_ROOT} left intact (rm -rf manually if desired)."
+    if [[ -f /etc/nftables.conf ]] && grep -qF "DFS-N namespace server: ENABLED" /etc/nftables.conf; then
+        echo "[dfs-remove] firewall ruleset header still says DFS-N is ENABLED; re-run 'samba-sconfig enable-firewall' to refresh it."
+    fi
 }
 
 usage_cli() {
