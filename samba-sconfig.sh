@@ -73,6 +73,26 @@ yesno() {
     fi
 }
 
+# info_text — sized dialog for message bodies that contain LITERAL
+# backslashes (DOMAIN\Group, UNC paths, captured wbinfo / samba-tool
+# output). Delegates to appcore_tui_show_text which uses --textbox
+# under the hood and reads the body file BYTE-for-BYTE, so a body
+# like 'NAIMOR\administrator' doesn't get mangled by whiptail's
+# --msgbox C-escape interpretation (`\a` → BEL, `\g` → ?, etc.).
+# Fallback path doubles `\` so single-backslash content still
+# renders correctly via --msgbox on older images without the lib.
+#
+# Use this instead of info() any time the body has a literal `\`
+# in it, OR embeds the output of a command that might contain one.
+info_text() {
+    local title="$1" body="$2"
+    if command -v appcore_tui_show_text >/dev/null 2>&1; then
+        appcore_tui_show_text "$title" "$body"
+    else
+        info "${body//\\/\\\\}"
+    fi
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "ERROR: Run as root (sudo samba-sconfig)." >&2
@@ -1136,9 +1156,23 @@ setup_domain_logins() {
     systemctl restart samba-ad-dc
     sleep 2
 
+    # info_text (not info) is required here — the body embeds
+    # `wbinfo -u` output which contains literal `\` characters
+    # (NAIMOR\administrator etc.). info() routes via --msgbox which
+    # interprets `\a`, `\g` etc. as C-escapes and mangles the
+    # display.
     local test_output
     test_output=$(wbinfo -u 2>&1 | head -5)
-    info "Domain logins configured.\n\nwbinfo -u:\n${test_output}\n\nSSH: ssh DOMAIN\\\\user@server"
+    local netbios_for_example
+    netbios_for_example=$(get_netbios 2>/dev/null)
+    [[ "$netbios_for_example" == "(not provisioned)" || -z "$netbios_for_example" ]] && netbios_for_example="DOMAIN"
+    info_text "Domain logins" "Domain logins configured.
+
+wbinfo -u (first 5):
+${test_output}
+
+SSH usage example:
+  ssh '${netbios_for_example}\\user'@server"
 }
 
 setup_domain_sudo() {
@@ -1179,7 +1213,7 @@ setup_domain_sudo() {
 
     local sudoers_entry
     sudoers_entry=$(appcore_id_domgroup_format_sudoers "$netbios" "$group") \
-        || { info "Cannot format sudoers entry for '${netbios}\\${group}'."; return; }
+        || { info_text "Sudo grant — error" "Cannot format sudoers entry for '${netbios}\\${group}'."; return; }
     local display_form
     display_form=$(appcore_id_domgroup_format_display "$netbios" "$group")
 
@@ -1189,11 +1223,16 @@ setup_domain_sudo() {
 SUDOEOF
     chmod 440 "$sudoers_file"
 
+    # Success/failure dialogs use info_text (not info) — the display
+    # form embeds a literal `\` between NETBIOS and group name that
+    # whiptail --msgbox would interpret as a C-escape introducer
+    # (`\D` → garbage, `\A` → BEL). info_text routes to --textbox
+    # which renders bytes verbatim.
     if visudo -cf "$sudoers_file" &>/dev/null; then
-        info "Sudo granted to '${display_form}'."
+        info_text "Sudo granted" "Sudo granted to '${display_form}'."
     else
         rm -f "$sudoers_file"
-        info "ERROR: Sudoers syntax validation failed for '${display_form}'.\nEntry removed."
+        info_text "Sudo grant — error" $'ERROR: Sudoers syntax validation failed for \''"${display_form}"$'\'.\nEntry removed.'
     fi
 }
 
