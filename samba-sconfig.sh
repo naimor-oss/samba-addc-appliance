@@ -760,6 +760,22 @@ search ${realm_lower}
 nameserver 127.0.0.1
 DNSEOF
 
+    # Re-align hostname / hostnamectl / /etc/hosts under the realm we
+    # actually joined or provisioned. Without this, /etc/hosts retains
+    # the stale realm the appliance was bound to before the operator
+    # set up Samba (e.g. lab.test from the build-time DHCP search
+    # domain, kept around after the operator joined a real production
+    # realm like naimor.naimorinc.com). Delegated to appliance-core's
+    # hostname lib so the rewrite logic + safe sed pattern + multi-NIC
+    # IP selection all live in one tested place.
+    if command -v appcore_hostname_align_to_realm >/dev/null 2>&1; then
+        if ! appcore_hostname_align_to_realm "$realm_lower"; then
+            echo "[sconfig] WARN: hostname/realm alignment to '${realm_lower}' failed; /etc/hosts may carry stale entries" >&2
+        fi
+    else
+        echo "[sconfig] WARN: appliance-core hostname lib not vendored; skipping /etc/hosts realm-alignment" >&2
+    fi
+
     systemctl unmask samba-ad-dc
     systemctl enable samba-ad-dc
     systemctl start samba-ad-dc
