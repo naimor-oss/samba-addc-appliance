@@ -1953,9 +1953,18 @@ _tui_show() {
 tui_dfs_init() {
     local share root
     share=$(whiptail --inputbox \
-        "DFS-N share name. Clients connect to \\\\<dc>\\<share>.\nMust match: letters/digits, dot, underscore, dash. Default: ${DFS_DEFAULT_SHARE}." \
-        12 70 "$DFS_DEFAULT_SHARE" 3>&1 1>&2 2>&3) || return
-    [[ "$share" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { info "Invalid share name."; return; }
+        "DFS-N share name. Clients connect to \\\\<dc>\\<share>.\nMust match: letters/digits/dot/underscore/dash, 1-80 chars.\nA trailing \$ marks the share hidden in network browsing\n(e.g. Public\$). Default: ${DFS_DEFAULT_SHARE}." \
+        14 76 "$DFS_DEFAULT_SHARE" 3>&1 1>&2 2>&3) || return
+    # Validate via appliance-core's SMB-name primitive (accepts trailing
+    # `$` for hidden shares); fallback to a permissive-of-`$` regex on
+    # older images.
+    local _share_ok=0
+    if command -v appcore_id_smb_name_validate >/dev/null 2>&1; then
+        appcore_id_smb_name_validate "$share" && _share_ok=1
+    else
+        [[ "$share" =~ ^[A-Za-z0-9._-]{1,64}\$?$ ]] && _share_ok=1
+    fi
+    (( _share_ok )) || { info "Invalid share name. Must be 1-80 SMB-name chars (letters/digits/dot/underscore/dash), with optional trailing \$ for hidden."; return; }
     root=$(whiptail --inputbox \
         "Filesystem path for the namespace store. Must be absolute.\nDefault: ${DFS_DEFAULT_ROOT}." \
         11 70 "$DFS_DEFAULT_ROOT" 3>&1 1>&2 2>&3) || return
@@ -1972,8 +1981,8 @@ tui_dfs_configure() {
     source "$DFS_CONF"
     local ns prefer
     ns=$(whiptail --inputbox \
-        "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-64 chars, letters/digits/dot/underscore/dash." \
-        12 72 "${DFS_NAMESPACES:-}" 3>&1 1>&2 2>&3) || return
+        "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-80 chars, letters/digits/dot/underscore/dash.\nA trailing \$ marks the namespace as hidden in network browsing\n(e.g. Engineering\$, Public\$)." \
+        14 76 "${DFS_NAMESPACES:-}" 3>&1 1>&2 2>&3) || return
     prefer=$(whiptail --inputbox \
         "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of each priority bucket. Leave blank to use AD priorityClass only.\nExample: ^\\\\\\\\WIN-" \
         13 72 "${DFS_PREFER:-}" 3>&1 1>&2 2>&3) || return
@@ -2568,6 +2577,13 @@ cli_dfs_init_inner() {
     local share="$1" root="$2"
     [[ -n "$share" && -n "$root" ]] || { echo "[dfs-init] share and root required" >&2; return 1; }
     [[ "$root" = /* ]] || { echo "[dfs-init] root must be absolute" >&2; return 1; }
+    # Share-name validation via the appliance-core primitive (accepts
+    # trailing-`$` for hidden namespace roots, e.g. dfs-init Public$
+    # /srv/samba/public).
+    if command -v appcore_id_smb_name_validate >/dev/null 2>&1; then
+        appcore_id_smb_name_validate "$share" \
+            || { echo "[dfs-init] reject share name: $share (must be 1-80 SMB-name chars, with optional trailing \$ for hidden)" >&2; return 1; }
+    fi
     install -d -m 0755 "$root"
     : > "${root}/${DFS_SENTINEL_NAME}"
     chmod 0644 "${root}/${DFS_SENTINEL_NAME}"
@@ -2613,8 +2629,23 @@ cli_dfs_configure() {
     [[ -z "$ns_list" ]] && { echo "[dfs-configure] no namespaces given" >&2; return 1; }
     local n
     for n in $ns_list; do
-        # Reuse the same character class we trust for path components.
-        [[ "$n" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "[dfs-configure] reject namespace name: $n" >&2; return 1; }
+        # Validate via appliance-core's SMB-name primitive. The earlier
+        # inline regex `^[A-Za-z0-9._-]{1,64}$` rejected the conventional
+        # trailing-`$` hidden-namespace marker (e.g. `Public$`), which is
+        # a Windows-network browsing convention we have to support.
+        # The primitive accepts trailing-`$`, dots, dashes, underscores;
+        # rejects embedded `$`, whitespace, NTFS-reserved chars, shell
+        # metas. Fallback to the historical regex when the lib isn't
+        # vendored — only relevant on a deployed image that predates
+        # appliance-core v0.10, since prepare-image.sh has been
+        # vendoring the libs since v0.5.
+        if command -v appcore_id_smb_name_validate >/dev/null 2>&1; then
+            appcore_id_smb_name_validate "$n" \
+                || { echo "[dfs-configure] reject namespace name: $n (must be 1-80 SMB-name chars, with optional trailing \$ for hidden)" >&2; return 1; }
+        else
+            [[ "$n" =~ ^[A-Za-z0-9._-]{1,64}\$?$ ]] \
+                || { echo "[dfs-configure] reject namespace name: $n" >&2; return 1; }
+        fi
         install -d -m 0755 "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}"
         : > "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}/${DFS_SENTINEL_NAME}"
     done
