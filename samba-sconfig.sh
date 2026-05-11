@@ -613,7 +613,13 @@ NetBIOS:          $(get_netbios)
 Update Policy:    $(get_update_policy)
 EOF
 )
-    whiptail --title "System Information" --scrolltext --msgbox "$info_text" 24 70
+    # `info_text` (not info, not whiptail --msgbox) — the body has
+    # `\n` literals + captured tool output that may contain bytes
+    # whiptail's --msgbox would mis-interpret. The expansion
+    # `${var//\\n/$'\n'}` converts the literal `\n`s the body-build
+    # used into real newlines so the verbatim --textbox renderer
+    # shows the line breaks the author intended.
+    info_text "System Information" "${info_text//\\n/$'\n'}"
 }
 
 #===============================================================================
@@ -1377,7 +1383,7 @@ run_sysvol_sync() {
 show_sysvol_freshness() {
     [[ -x /usr/local/sbin/sysvol-sync ]] || { info "sysvol-sync helper missing. Re-run prepare-image.sh."; return; }
     local output; output=$(/usr/local/sbin/sysvol-sync --status 2>&1)
-    whiptail --title "SYSVOL Freshness" --scrolltext --msgbox "$output" 24 96
+    info_text "SYSVOL Freshness" "${output//\\n/$'\n'}"
 }
 
 reset_sysvol_acls() {
@@ -1391,19 +1397,48 @@ reset_sysvol_acls() {
 }
 
 show_sync_status() {
-    local st="SYSVOL Sync Status\n==================\n\n"
+    # Build with REAL newlines (so the body passes through verbatim
+    # via info_text/--textbox without depending on whiptail's escape
+    # interpretation). Captured tool output via $() lands with real
+    # newlines too, so the resulting body has one consistent line
+    # break convention end-to-end.
+    local st
+    st="SYSVOL Sync Status
+==================
+
+"
     if [[ -f "$SYSVOL_SYNC_CONF" ]]; then
         # shellcheck disable=SC1091
         source "$SYSVOL_SYNC_CONF"
-        st+="Interval:   ${SYNC_INTERVAL:-?} min\n"
-        st+="Preferred:  ${PREFERRED_DCS:-<none>}\n"
-        st+="Excluded:   ${EXCLUDE_DCS:-<none>}\n\n"
+        st+="Interval:   ${SYNC_INTERVAL:-?} min
+Preferred:  ${PREFERRED_DCS:-<none>}
+Excluded:   ${EXCLUDE_DCS:-<none>}
+
+"
     else
-        st+="Not configured.\n\n"
+        st+="Not configured.
+
+"
     fi
-    [[ -f "$SYSVOL_SYNC_CRON" ]] && st+="Cron:\n$(cat "$SYSVOL_SYNC_CRON")\n\n" || st+="Cron: not installed\n\n"
-    [[ -f /var/log/samba/sysvol-sync.log ]] && st+="Last 12 log lines:\n$(tail -12 /var/log/samba/sysvol-sync.log)\n" || st+="No sync log yet.\n"
-    whiptail --title "Sync Status" --scrolltext --msgbox "$st" 24 88
+    if [[ -f "$SYSVOL_SYNC_CRON" ]]; then
+        st+="Cron:
+$(cat "$SYSVOL_SYNC_CRON")
+
+"
+    else
+        st+="Cron: not installed
+
+"
+    fi
+    if [[ -f /var/log/samba/sysvol-sync.log ]]; then
+        st+="Last 12 log lines:
+$(tail -12 /var/log/samba/sysvol-sync.log)
+"
+    else
+        st+="No sync log yet.
+"
+    fi
+    info_text "Sync Status" "$st"
 }
 
 #===============================================================================
@@ -2011,8 +2046,17 @@ menu_dfs() {
 # is fragile when whiptail eats stdin on its own side. Capture into a var
 # first, then feed whiptail explicitly.
 _tui_show() {
-    local title="$1" body="$2" h="${3:-20}" w="${4:-78}"
-    whiptail --title "$title" --scrolltext --msgbox "$body" "$h" "$w"
+    # Route via info_text → appcore_tui_show_text → whiptail --textbox.
+    # The old --msgbox path interpreted backslash escapes in the body
+    # (`\a` → BEL, `\b` → backspace, `\D`/`\g` → garbage), which mangled
+    # any captured tool output that contained literal `\` characters
+    # or stray escape-shaped bytes — the SYSVOL Sync Status / DNS /
+    # Sanity Check dialogs all hit this. --textbox reads bytes verbatim.
+    # The size hints (h, w) are accepted but unused — appcore_tui_size
+    # auto-sizes from `tput` (full terminal, ceilings) which renders
+    # better than fixed 20x78 on roomy consoles.
+    local title="$1" body="$2"
+    info_text "$title" "$body"
 }
 
 tui_dfs_init() {
@@ -2445,7 +2489,7 @@ run_full_sanity() {
     r+="PASSED: $pass | WARNINGS: $wrn | FAILED: $fail\n"
     [[ $fail -eq 0 ]] && r+="\nOverall: HEALTHY" || r+="\nOverall: ISSUES DETECTED"
 
-    whiptail --title "Sanity Check" --scrolltext --msgbox "$r" 34 76
+    info_text "Sanity Check" "${r//\\n/$'\n'}"
 }
 
 test_dns() {
@@ -2458,34 +2502,34 @@ test_dns() {
     out+="_kerberos._tcp:\n$(dig -t SRV @localhost "_kerberos._tcp.${rl}" +short 2>&1)\n\n"
     out+="_gc._tcp:\n$(dig -t SRV @localhost "_gc._tcp.${rl}" +short 2>&1)\n\n"
     out+="Forwarding (google.com):\n$(dig @localhost google.com +short 2>&1)\n"
-    whiptail --title "DNS" --scrolltext --msgbox "$out" 26 76
+    info_text "DNS" "${out//\\n/$'\n'}"
 }
 
 test_kerberos() {
     is_provisioned || { info "Not provisioned."; return; }
     local pass; pass=$(whiptail --passwordbox "Administrator password:" 10 60 3>&1 1>&2 2>&3) || return
     local out; out=$(echo "$pass" | kinit administrator 2>&1); out+="\n\n$(klist 2>&1)"
-    whiptail --title "Kerberos" --scrolltext --msgbox "$out" 20 76
+    info_text "Kerberos" "${out//\\n/$'\n'}"
 }
 
 test_smb() {
-    whiptail --title "SMB" --scrolltext --msgbox "$(smbclient -L localhost -U% -N 2>&1)" 20 76
+    info_text "SMB" "$(smbclient -L localhost -U% -N 2>&1)"
 }
 
 show_domain_info() {
     is_provisioned || { info "Not provisioned."; return; }
     # shellcheck disable=SC2155  # samba-tool's rc is informational here, not load-bearing
     local out="=== Domain ===\n\n$(samba-tool domain level show 2>&1)\n\nFSMO:\n$(samba-tool fsmo show 2>&1)\n"
-    whiptail --title "Domain Info" --scrolltext --msgbox "$out" 24 76
+    info_text "Domain Info" "${out//\\n/$'\n'}"
 }
 
 test_replication() {
     is_provisioned || { info "Not provisioned."; return; }
-    whiptail --title "Replication" --scrolltext --msgbox "$(samba-tool drs showrepl 2>&1)" 24 76
+    info_text "Replication" "$(samba-tool drs showrepl 2>&1)"
 }
 
 show_logs() {
-    whiptail --title "Logs (last 50)" --scrolltext --msgbox "$(journalctl -u samba-ad-dc -n 50 --no-pager 2>&1)" 24 76
+    info_text "Logs (last 50)" "$(journalctl -u samba-ad-dc -n 50 --no-pager 2>&1)"
 }
 
 #===============================================================================
@@ -2518,8 +2562,7 @@ menu_services() {
                is_addc_running && info "Restarted." || info "FAILED. Check logs." ;;
             4) systemctl start chrony; info "Started." ;;
             5) systemctl restart chrony; info "Restarted." ;;
-            6) whiptail --title "Status" --scrolltext --msgbox \
-                "$(systemctl status samba-ad-dc chrony nftables 2>&1 | head -40)" 24 76 ;;
+            6) info_text "Status" "$(systemctl status samba-ad-dc chrony nftables 2>&1 | head -40)" ;;
             B|b) return ;;
         esac
     done
