@@ -1587,24 +1587,50 @@ DROPEOF
 
     local smb=/etc/samba/smb.conf
     if ! grep -qF "include = $DFS_INCLUDE_FILE" "$smb" 2>/dev/null; then
-        # Insert INTO [global], not at EOF. The post-provision smb.conf
-        # ends with [sysvol]/[netlogon], so an EOF append lands inside
-        # the last service section. Samba still parses the include's
-        # own [dfs_root] section header, but testparm reports the
-        # include line as a service parameter — confusing and brittle.
-        # Mirrors the technique in apply_hardening_to_smb_conf.
+        # Where to place the `include` line is load-bearing. Samba's
+        # parser treats `include = path` as if the included file's
+        # content were spliced in at that point: the included file's
+        # first section header (`[dfs_root]` here) replaces the
+        # current parsing section. So an include placed at the TOP of
+        # `[global]` makes EVERY subsequent line in the main file
+        # land in `[dfs_root]`, including the rest of the global
+        # parameters. testparm then complains "Global parameter X
+        # found in service section!" for every line below the
+        # include — and in some cases the value really is ignored
+        # because Samba honors the section context.
+        #
+        # Insert at the END of `[global]` instead: just before the
+        # next `[...]` header (typically `[sysvol]`), or at EOF if
+        # the main file has no other section. The section switch the
+        # include performs is then immediately followed by `[sysvol]`
+        # (or EOF), so nothing leaks back into `[global]`.
         local tmp
         tmp=$(mktemp)
         awk -v inc="$DFS_INCLUDE_FILE" '
-            BEGIN { inserted = 0 }
+            BEGIN { in_global = 0; inserted = 0 }
             /^\[global\][[:space:]]*$/ && !inserted {
+                in_global = 1
                 print
+                next
+            }
+            /^\[/ && in_global && !inserted {
+                # Transitioning out of [global] — emit include first.
                 print "\t# Added by samba-sconfig dfs-init"
                 print "\tinclude = " inc
                 inserted = 1
+                in_global = 0
+                print
                 next
             }
             { print }
+            END {
+                # [global] is the only section (no [sysvol] / [netlogon]
+                # yet — pre-provision smb.conf shape).
+                if (in_global && !inserted) {
+                    print "\t# Added by samba-sconfig dfs-init"
+                    print "\tinclude = " inc
+                }
+            }
         ' "$smb" > "$tmp"
         cat "$tmp" > "$smb"
         rm -f "$tmp"

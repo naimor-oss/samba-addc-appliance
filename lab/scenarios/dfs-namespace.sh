@@ -175,6 +175,25 @@ verify() {
     grep -q "msdfs root = yes" <<< "$out" || { say "msdfs root not in drop-in"; rc=1; }
     grep -q "read only = yes"  <<< "$out" || { say "drop-in is not read-only"; rc=1; }
 
+    say "smb.conf include position does NOT leak [global] params into [dfs_root]"
+    # The include line splices the included file's content at its
+    # position, and the included file starts with [dfs_root]. If the
+    # include is at the TOP of [global], every subsequent line in
+    # smb.conf gets parsed under [dfs_root] context — testparm then
+    # prints "Global parameter X found in service section!" for each.
+    # The correct fix (samba-sconfig _dfs_write_drop_in) inserts the
+    # include at the END of [global], so its section switch happens
+    # immediately before the next service section. This assertion
+    # pins that behavior.
+    out=$(ssh_vm 'sudo testparm -s 2>&1 1>/dev/null')
+    if grep -q "Global parameter .* found in service section" <<< "$out"; then
+        say "testparm reports Global-in-service drift — _dfs_write_drop_in placement regression:"
+        grep "Global parameter .* found in service section" <<< "$out" | sed 's/^/  /'
+        rc=1
+    else
+        echo "  clean (no Global-in-service warnings)"
+    fi
+
     say "share is registered (testparm sees it as a top-level section)"
     # testparm parses the live smb.conf graph and is authoritative for
     # whether Samba's parser recognized the include + share. An
