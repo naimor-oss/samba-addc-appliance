@@ -2294,7 +2294,15 @@ table inet filter {
         tcp dport 636 accept                      # LDAPS
         tcp dport { 3268, 3269 } accept           # Global Catalog
         tcp dport 49152-65535 accept              # ephemeral RPC
-        log prefix "nft-drop: " limit rate 5/minute
+        # `level info` keeps drop messages out of the system console.
+        # Default nft `log` emits at kernel-warning level (4) which
+        # equals Debian's default printk console threshold, so every
+        # drop spams the console. `info` (6) is above the threshold
+        # — messages still reach journald (queryable via
+        # `journalctl -k -t kernel --grep nft-drop`) but stay off
+        # the console. Reinforced by /etc/sysctl.d/30-quiet-console.conf
+        # which pins console_loglevel=4.
+        log prefix "nft-drop: " level info limit rate 5/minute
         drop
     }
     chain forward { type filter hook forward priority 0; policy drop; }

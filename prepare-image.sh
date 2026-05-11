@@ -536,13 +536,69 @@ table inet filter {
         tcp dport 636 accept
         tcp dport { 3268, 3269 } accept
         tcp dport 49152-65535 accept
-        log prefix "nft-drop: " limit rate 5/minute
+        # level info keeps drop messages off the system console (see
+        # /etc/sysctl.d/30-quiet-console.conf for the printk threshold).
+        log prefix "nft-drop: " level info limit rate 5/minute
         drop
     }
     chain forward { type filter hook forward priority 0; policy drop; }
     chain output  { type filter hook output priority 0; policy accept; }
 }
 NFTEOF
+
+#===============================================================================
+# 20b. CONSOLE QUIET + JOURNALD CAPS
+#
+# Two related defaults the appliance bakes in so an operator never has to
+# deal with kernel chatter on the console or an unbounded journal:
+#
+#   1. Pin kernel.printk console threshold to 4 (WARN). Without this,
+#      a default-Debian kernel running with current console_loglevel=7
+#      (DEBUG) prints every kernel info/notice line to /dev/console —
+#      most visibly the nftables `log` lines from firewall drops, but
+#      also boot-time hardware probes, USB events, etc. With threshold
+#      4 only WARN/ERR/CRIT/ALERT/EMERG hit the console; everything
+#      else still lands in journald (queryable, just quiet).
+#
+#   2. Bound journald disk usage. Default journald keeps growing until
+#      it hits 10% of /var — fine on a 100 GB rootfs, surprising on a
+#      small appliance image. Cap at 200 MB total / 50 MB per file.
+#      Journald rotates automatically; no logrotate config needed.
+#
+# These are dropped in under /etc/sysctl.d and /etc/systemd/journald.conf.d
+# so deployed images get the right defaults without operator action and
+# without overriding any explicit operator config.
+#===============================================================================
+log "Installing console-quiet + journald-size drop-ins..."
+cat > /etc/sysctl.d/30-quiet-console.conf <<'SYSCTLEOF'
+# Suppress kernel info/debug/notice messages on the console. They
+# still reach journald (`journalctl -k`) but stay off /dev/console
+# and serial console. Required so nftables `log` rules don't spam
+# the boot console — see /etc/nftables-samba-addc.conf which uses
+# `log ... level info` to land just above this threshold.
+#   field 1: current console_loglevel — only msgs < this print
+#   field 2: default_message_loglevel — printk() default
+#   field 3: minimum_console_loglevel — operator-settable floor
+#   field 4: default_console_loglevel
+# 4 4 1 7 == only WARN and above to console; default messages at
+# WARN; floor at 1 (only PANIC blocks operator override).
+kernel.printk = 4 4 1 7
+SYSCTLEOF
+chmod 0644 /etc/sysctl.d/30-quiet-console.conf
+
+install -d -m 0755 /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/30-appliance-caps.conf <<'JOURNALEOF'
+# Cap journald disk usage so a chatty kernel (or noisy AD audit
+# output) doesn't fill the rootfs. Journald rotates automatically
+# at SystemMaxFileSize, deletes oldest archives when SystemMaxUse
+# is exceeded, and reserves SystemKeepFree free space for other
+# writers. No logrotate config needed.
+[Journal]
+SystemMaxUse=200M
+SystemMaxFileSize=50M
+SystemKeepFree=200M
+JOURNALEOF
+chmod 0644 /etc/systemd/journald.conf.d/30-appliance-caps.conf
 
 #===============================================================================
 # 21. SYSVOL-SYNC HELPER
