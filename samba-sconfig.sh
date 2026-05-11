@@ -1105,21 +1105,54 @@ setup_domain_sudo() {
     netbios=$(get_netbios)
     [[ "$netbios" == "(not provisioned)" ]] && { info "Not provisioned."; return; }
 
-    local sudo_group
-    sudo_group=$(whiptail --inputbox "Domain group to grant sudo:" \
-        10 64 "Domain Admins" 3>&1 1>&2 2>&3) || return
+    # The previous implementation hand-wrote the sudoers entry
+    # (`%${netbios}\\\\${sudo_group}`), which produced two bugs in
+    # the field:
+    #   (1) "Domain Admins" was rejected with a sudoers "syntax error"
+    #       because the literal space inside the group portion
+    #       confuses sudo's parser.
+    #   (2) When the operator worked around that by typing "Domain\
+    #       Admins", the backslash-escape leaked into the displayed
+    #       confirmation as "NAIMOR\\Domain\ Admins".
+    # Both bugs go away when input parsing and per-context formatting
+    # come from appliance-core's identity.sh primitives. The operator
+    # can type any of the accepted forms; we canonicalize once and
+    # emit per-context strings (sudoers vs display vs smb) from the
+    # same source.
+    local raw_group
+    while true; do
+        raw_group=$(whiptail --inputbox "Domain group to grant sudo:" \
+            10 64 "Domain Admins" 3>&1 1>&2 2>&3) || return
+        if appcore_id_domgroup_validate "$raw_group"; then
+            break
+        fi
+        info "Invalid group name. Examples of accepted forms:\n  Domain Admins\n  Engineering Users"
+    done
+
+    # Parse once into canonical components. The input may have arrived
+    # bare ("Domain Admins") or with a NETBIOS prefix the operator
+    # added. Strip any operator-supplied domain — we apply $netbios
+    # ourselves so the sudoers entry can never mismatch the host.
+    appcore_id_domgroup_parse "$raw_group"
+    local group="$APPCORE_ID_DG_GROUP"
+
+    local sudoers_entry
+    sudoers_entry=$(appcore_id_domgroup_format_sudoers "$netbios" "$group") \
+        || { info "Cannot format sudoers entry for '${netbios}\\${group}'."; return; }
+    local display_form
+    display_form=$(appcore_id_domgroup_format_display "$netbios" "$group")
 
     local sudoers_file="/etc/sudoers.d/domain-admins"
-    cat > "$sudoers_file" << SUDOEOF
-%${netbios}\\\\${sudo_group}  ALL=(ALL:ALL) ALL
+    cat > "$sudoers_file" <<SUDOEOF
+%${sudoers_entry}  ALL=(ALL:ALL) ALL
 SUDOEOF
     chmod 440 "$sudoers_file"
 
     if visudo -cf "$sudoers_file" &>/dev/null; then
-        info "Sudo granted to '${netbios}\\${sudo_group}'."
+        info "Sudo granted to '${display_form}'."
     else
         rm -f "$sudoers_file"
-        info "ERROR: Syntax validation failed. Entry removed."
+        info "ERROR: Sudoers syntax validation failed for '${display_form}'.\nEntry removed."
     fi
 }
 
