@@ -999,7 +999,14 @@ domain_provision_new() {
         if command -v appcore_tui_show_capture >/dev/null 2>&1; then
             appcore_tui_show_capture "Provision FAILED (rc=$prov_rc)" "$prov_log"
         else
-            info "Provision FAILED (rc=$prov_rc).\n\n$(tail -10 "$prov_log")\n\nCheck the full log: $prov_log"
+            # Fallback when the lib isn't vendored: route via info_text
+            # so the tail-of-log content (which may contain backslashes
+            # in paths or escape-shaped bytes) renders verbatim.
+            info_text "Provision FAILED (rc=$prov_rc)" "Provision FAILED (rc=$prov_rc).
+
+$(tail -10 "$prov_log")
+
+Check the full log: $prov_log"
         fi
         rm -f "${prov_log}.rc"
         return 1
