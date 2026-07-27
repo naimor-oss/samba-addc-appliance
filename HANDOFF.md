@@ -2,7 +2,7 @@
 
 This file used to contain a one-time Claude handoff checklist for the
 original single-repo Hyper-V lab. It is retired; the project now lives
-across five sibling repos under `Debian-SAMBA/`.
+across six sibling repos under `Debian-SAMBA/`.
 
 Use these maintained docs instead:
 

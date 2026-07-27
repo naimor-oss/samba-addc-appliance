@@ -52,6 +52,11 @@ verify() {
     ssh_vm 'ping -c 1 -W 2 10.10.10.1 >/dev/null' || rc=1
     ssh_vm 'getent hosts debian.org >/dev/null' || rc=1
 
+    say "firstboot freshness check completed without an apt lock failure"
+    out=$(ssh_vm 'sudo grep "apt: " /var/log/samba-firstboot.log | tail -1' 2>&1 || true)
+    echo "$out"
+    grep -q 'apt: image is current (0 upgrades pending)' <<< "$out" || rc=1
+
     say "first-launch marker has not been consumed"
     ssh_vm 'test ! -f /var/lib/samba-sconfig/first-boot-done' || rc=1
 

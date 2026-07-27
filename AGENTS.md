@@ -20,9 +20,10 @@ Build and test a Samba Active Directory Domain Controller appliance on Debian
 - `samba-sconfig.sh`: whiptail TUI plus headless CLI for provision, join,
   hardening, diagnostics, and service maintenance.
 
-This repo is one of five siblings under `Debian-SAMBA/` (alongside
-`dev-commons`, `lab-kit`, `lab-router`, and `smb-proxy-appliance`).
-It consumes `lab-kit` and `lab-router` at runtime; see
+This repo is one of six siblings under `Debian-SAMBA/` (alongside
+`dev-commons`, `lab-kit`, `lab-router`, `appliance-core`, and
+`smb-proxy-appliance`). It consumes `lab-kit` and `lab-router` at runtime
+and vendors `appliance-core` during image preparation; see
 [`../dev-commons/REPO-SPLIT.md`](../dev-commons/REPO-SPLIT.md) for the
 full sibling layout, dependency map, and per-repo scope.
 

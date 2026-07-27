@@ -126,8 +126,14 @@ else
 fi
 
 step "1. stage base VHDX + seed ISO"
-"$SCRIPT_DIR/stage-samba-base.sh" \
-    -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" "${STAGER_KEY_ARGS[@]}" -s "$ISO_DIR_MAC"
+if [[ ${#STAGER_KEY_ARGS[@]} -gt 0 ]]; then
+    "$SCRIPT_DIR/stage-samba-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" \
+        "${STAGER_KEY_ARGS[@]}" -s "$ISO_DIR_MAC"
+else
+    "$SCRIPT_DIR/stage-samba-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" -s "$ISO_DIR_MAC"
+fi
 
 step "2. push host-side helper scripts to $STAGE_DIR_HOST"
 mkdir -p "$STAGE_DIR_MAC"

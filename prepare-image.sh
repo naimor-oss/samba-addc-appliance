@@ -289,11 +289,16 @@ PWSH_INSTALLED=false
 # build and avoids leaving a half-configured Microsoft source behind.
 rm -f /etc/apt/sources.list.d/microsoft.list /usr/share/keyrings/microsoft-archive-keyring.gpg
 
-PWSH_VER="7.6.0"
+PWSH_VER="7.6.4"
 PWSH_DEB="powershell_${PWSH_VER}-1.deb_amd64.deb"
+PWSH_SHA256="E5688E0569568D48051C49D3E93504CDE47AF709CDAAABD9A8892BC676B3BDF3"
 if wget -q "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VER}/${PWSH_DEB}" -O "/tmp/${PWSH_DEB}"; then
-    dpkg -i "/tmp/${PWSH_DEB}" 2>/dev/null || true
-    apt-get install -f -y
+    if printf '%s  %s\n' "$PWSH_SHA256" "/tmp/${PWSH_DEB}" | sha256sum -c -; then
+        dpkg -i "/tmp/${PWSH_DEB}" 2>/dev/null || true
+        apt-get install -f -y
+    else
+        warn "PowerShell package checksum verification failed"
+    fi
     rm -f "/tmp/${PWSH_DEB}"
     if command -v pwsh &>/dev/null; then
         PWSH_INSTALLED=true
@@ -1360,6 +1365,22 @@ printf '%s\n' "$RECS" | tee -a "$LOGFILE"
 log ""
 log "checking image freshness (apt-get update + upgradable count)..."
 APT_FRESHNESS=""
+apt_update_with_lock_retry() {
+    local attempt
+    for attempt in $(seq 1 12); do
+        if apt-get update -qq >>"$LOGFILE" 2>&1; then
+            return 0
+        fi
+        if tail -n 6 "$LOGFILE" \
+            | grep -qE 'Could not get lock|Unable to lock'; then
+            log "  apt lock busy; retrying freshness check (${attempt}/12)"
+            sleep 5
+        else
+            return 1
+        fi
+    done
+    return 1
+}
 # Wait up to 20s for default route to settle (netplan/dhcp may still be
 # negotiating right after the agent install above).
 for _ in $(seq 1 10); do
@@ -1368,7 +1389,7 @@ for _ in $(seq 1 10); do
 done
 if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
-elif apt-get update -qq >>"$LOGFILE" 2>&1; then
+elif apt_update_with_lock_retry; then
     # Use --simulate to count what apt would ACTUALLY install. Plain
     # `apt list --upgradable` includes phased-rollout packages (apt 2.x
     # feature: held back per-machine until the rollout completes), and
