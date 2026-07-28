@@ -428,8 +428,32 @@ get_addr_source() {
 }
 
 get_current_dns() {
-    # First non-comment nameserver in /etc/resolv.conf
-    awk '/^nameserver[[:space:]]/ { print $2; exit }' /etc/resolv.conf 2>/dev/null
+    local dns
+    dns=$(resolvectl dns 2>/dev/null \
+        | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) printf "%s ", $i}' \
+        | sed 's/ *$//')
+    if [[ -n "$dns" ]]; then
+        printf '%s\n' "$dns"
+        return
+    fi
+
+    # First boot records DHCP's upstream resolvers before any TUI
+    # transition. Keep that useful value if systemd-resolved has no
+    # live per-link result at the moment the dialog opens.
+    if [[ -f /var/lib/samba-init-detected.env ]]; then
+        dns=$(awk -F= '$1 == "DET_DHCP_DNS" {
+            value=substr($0, index($0, "=") + 1)
+            sub(/^"/, "", value); sub(/"$/, "", value)
+            print value; exit
+        }' /var/lib/samba-init-detected.env)
+        if [[ -n "$dns" ]]; then
+            printf '%s\n' "$dns"
+            return
+        fi
+    fi
+
+    awk '/^nameserver[[:space:]]/ { print $2; exit }' \
+        /etc/resolv.conf 2>/dev/null
 }
 
 config_network() {
@@ -445,7 +469,8 @@ config_network() {
     fi
     appcore_netconfig_change_tui_single_nic \
         /etc/netplan/60-samba-init.yaml \
-        'e*'
+        'e*' \
+        "$(get_current_dns)"
 }
 
 config_timezone() { dpkg-reconfigure tzdata; }

@@ -211,7 +211,7 @@ du -sh "$VMTOOLS_CACHE"/* 2>/dev/null | sed 's|^|    |'
 #===============================================================================
 log "Updating package index and upgrading system..."
 apt-get update -y
-apt-get upgrade -y
+apt-get full-upgrade -y
 
 #===============================================================================
 # 4. BASE TOOLS (replaces manual post-install steps)
@@ -497,19 +497,10 @@ else
 fi
 
 #===============================================================================
-# 19. MOTD BANNER
+# 19. STATIC MOTD
 #===============================================================================
-log "Setting login banner..."
-cat > /etc/motd << 'MOTDEOF'
-
-  ╔═══════════════════════════════════════════════════════╗
-  ║        Samba Active Directory Domain Controller       ║
-  ║                  Debian 13 (Trixie)                   ║
-  ╠═══════════════════════════════════════════════════════╣
-  ║  Run 'sudo samba-sconfig' to configure this server.   ║
-  ╚═══════════════════════════════════════════════════════╝
-
-MOTDEOF
+log "Clearing static MOTD; update-motd.d provides the login status..."
+: > /etc/motd
 
 #===============================================================================
 # 20. NFTABLES FIREWALL RULESET (inactive)
@@ -1739,12 +1730,14 @@ config_network() {
     # writes proper netplan, applies, and shows the result via the
     # sized-textbox renderer (no clipping on long output).
     if command -v appcore_netconfig_change_tui_single_nic >/dev/null 2>&1; then
+        load_detect_env
         sudo bash -c '
             source /usr/local/lib/appliance-core/netconfig.sh
             appcore_netconfig_change_tui_single_nic \
                 /etc/netplan/60-samba-init.yaml \
-                "e*"
-        '
+                "e*" \
+                "$1"
+        ' bash "$DET_DHCP_DNS"
         return
     fi
     # Fallback for older images without the lib.
@@ -2167,6 +2160,10 @@ chmod +x /etc/update-motd.d/15-samba-net-status
 #===============================================================================
 # 25. FINAL CLEANUP
 #===============================================================================
+log "Applying final package updates..."
+apt-get update -y
+apt-get full-upgrade -y
+
 log "Final cleanup..."
 apt-get autoremove -y --purge
 apt-get clean

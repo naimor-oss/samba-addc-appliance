@@ -57,6 +57,10 @@ verify() {
     echo "$out"
     grep -q 'apt: image is current (0 upgrades pending)' <<< "$out" || rc=1
 
+    say "SSH login has one dynamic Samba status and no duplicate static banner"
+    ssh_vm 'test ! -s /etc/motd' || rc=1
+    ssh_vm 'test -x /etc/update-motd.d/15-samba-net-status' || rc=1
+
     say "first-launch marker has not been consumed"
     ssh_vm 'test ! -f /var/lib/samba-sconfig/first-boot-done' || rc=1
 
