@@ -278,7 +278,7 @@ need one of them to work:
 3. **TTY1 console wizard.** Open the hypervisor's console on a freshly
    deployed VM and you land directly in `samba-init`, a whiptail-driven
    setup wizard. From there you can configure the network (DHCP or
-   static), change the password, paste your own SSH public key, set the
+   static), change the password, add your own SSH public key, set the
    hostname, and view the `samba-firstboot` log — all without any
    network connectivity. This is the path to use when DHCP didn't work
    on the deployment network and SSH therefore can't reach the VM.
@@ -297,11 +297,19 @@ Wizard menu:
 | 1 | Show network & setup status | Hostname, all NIC IPs, default route, DNS, AD-DC service state — pure read-only |
 | 2 | Configure network | DHCP or static; writes `/etc/netplan/60-samba-init.yaml` and runs `netplan apply` |
 | 3 | Change debadmin password | Required before "Mark setup complete" succeeds |
-| 4 | Add an SSH authorized_keys entry | Paste a pubkey; appended to `~debadmin/.ssh/authorized_keys` |
+| 4 | Add an SSH authorized_keys entry | Paste a complete key, or type an Ed25519 key as four validated 17-character parts; fingerprint is confirmed before appending |
 | 5 | Set hostname | NetBIOS-compatible (1-15 chars, starts with a letter) |
 | 6 | Show samba-firstboot log | Diagnostics from the host-tailoring step |
 | S | Drop to a root shell | Escape hatch for when the wizard isn't enough |
 | D | Mark setup complete and proceed to login | Refused while default password is still active |
+
+For QEMU/KVM deployments whose browser console is based on noVNC
+(including Synology VMM), ordinary browser paste does not reach a Linux
+text console. In Chrome, the optional
+[`KVM Console Paste`](https://chromewebstore.google.com/detail/kvm-console-paste/acogolacfpbgbddopekjchlckaggmjkd)
+extension can simulate the necessary keystrokes after it is allowed for
+the VMM site. If browser extensions are not permitted, use the wizard's
+four-part Ed25519 entry method instead.
 
 To re-arm the wizard after marking it done (for example, to re-test the
 flow on a re-imaged VM), reverse the marker:

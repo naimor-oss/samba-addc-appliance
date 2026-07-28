@@ -1761,20 +1761,104 @@ change_password() {
     fi
 }
 
+ssh_key_console_hint() {
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$virt" in
+        qemu|kvm)
+            printf '%s' \
+                "Web noVNC console (including Synology VMM): normal clipboard paste does not work in this text screen.\n\nOptional: in Chrome, install \"KVM Console Paste\" from the Chrome Web Store, allow it for this VMM site, then use it to send the key.\n\nOtherwise Cancel and choose manual entry."
+            ;;
+        *)
+            printf '%s' \
+                "Use the virtual console's clipboard control if available.\nIf paste fails, Cancel and use manual entry."
+            ;;
+    esac
+}
+
+read_pasted_ssh_key() {
+    local hint key
+    hint=$(ssh_key_console_hint)
+    key=$(whiptail --title "Paste SSH public key" --inputbox \
+        "Paste one complete public-key line into the entry field, then select OK.\n\nExpected form:\nssh-ed25519 AAAA... optional-comment\n\n${hint}" \
+        20 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return 1
+    [[ -n "$key" ]] || return 1
+    printf '%s' "$key"
+}
+
+read_typed_ed25519_key() {
+    local body="" chunk part start end
+    for part in 1 2 3 4; do
+        start=$(( (part - 1) * 17 + 1 ))
+        end=$(( part * 17 ))
+        while true; do
+            chunk=$(whiptail --title "Type Ed25519 key — part ${part} of 4" \
+                --inputbox \
+                "Type characters ${start}-${end} of the 68-character text after \"ssh-ed25519 \".\n\nRuler: 12345678901234567\nEnter exactly 17 characters. Do not type spaces or the optional comment.\n\nCompleted: ${#body}/68 characters" \
+                15 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return 1
+            if [[ "$chunk" =~ ^[A-Za-z0-9+/]{17}$ ]]; then
+                break
+            fi
+            whiptail --msgbox \
+                "That part must contain exactly 17 base64 characters:\nA-Z, a-z, 0-9, +, or /." \
+                10 "$WT_WIDTH"
+        done
+        body+="$chunk"
+    done
+    printf 'ssh-ed25519 %s' "$body"
+}
+
+confirm_ssh_public_key() {
+    local key="$1" key_info tmp
+    tmp=$(mktemp /tmp/samba-init-key.XXXXXX) || {
+        whiptail --msgbox "Could not create a temporary file; key not added." 8 "$WT_WIDTH"
+        return 1
+    }
+    printf '%s\n' "$key" > "$tmp"
+    if ! key_info=$(ssh-keygen -lf "$tmp" 2>/dev/null); then
+        rm -f "$tmp"
+        whiptail --msgbox \
+            "The completed text is not a valid SSH public key.\nCheck it against the original and try again." \
+            10 "$WT_WIDTH"
+        return 1
+    fi
+    rm -f "$tmp"
+    whiptail --title "Confirm SSH public key" --yesno \
+        "Valid key fingerprint:\n\n${key_info}\n\nAdd this key for ${SELF_USER}?" \
+        13 "$WT_WIDTH"
+}
+
 add_ssh_key() {
-    whiptail --msgbox "Paste the public key below and press OK.\n(Enter the full 'ssh-ed25519 AAA...' line.)" 10 "$WT_WIDTH"
-    local key
-    key=$(whiptail --inputbox "SSH public key:" 11 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return
-    [[ -n "$key" ]] || return
+    local key method
+    method=$(whiptail --title "Add SSH public key" --menu \
+        "Choose how to enter the key." 14 "$WT_WIDTH" 3 \
+        "P" "Paste one complete public-key line" \
+        "T" "Type an Ed25519 key in four short parts" \
+        "B" "Back" \
+        3>&1 1>&2 2>&3) || return
+    case "$method" in
+        P) key=$(read_pasted_ssh_key) || return ;;
+        T) key=$(read_typed_ed25519_key) || return ;;
+        *) return ;;
+    esac
+
     case "$key" in
         ssh-rsa\ *|ssh-ed25519\ *|ecdsa-*\ *|sk-*) ;;
         *) whiptail --msgbox "That doesn't look like an SSH public key (no algorithm prefix)." 8 70; return ;;
     esac
-    local home; home=$(getent passwd "$SELF_USER" | cut -d: -f6)
+    confirm_ssh_public_key "$key" || return
+
+    local auth_file home
+    home=$(getent passwd "$SELF_USER" | cut -d: -f6)
+    auth_file="$home/.ssh/authorized_keys"
     sudo install -d -o "$SELF_USER" -g "$SELF_USER" -m 0700 "$home/.ssh"
-    if echo "$key" | sudo tee -a "$home/.ssh/authorized_keys" >/dev/null; then
-        sudo chown "$SELF_USER:$SELF_USER" "$home/.ssh/authorized_keys"
-        sudo chmod 0600 "$home/.ssh/authorized_keys"
+    if sudo test -f "$auth_file" && sudo grep -qxF -- "$key" "$auth_file"; then
+        whiptail --msgbox "That key is already authorized for ${SELF_USER}." 8 "$WT_WIDTH"
+        return
+    fi
+    if printf '%s\n' "$key" | sudo tee -a "$auth_file" >/dev/null; then
+        sudo chown "$SELF_USER:$SELF_USER" "$auth_file"
+        sudo chmod 0600 "$auth_file"
         whiptail --msgbox "Key added. SSH login as ${SELF_USER} will accept it." 9 "$WT_WIDTH"
     else
         whiptail --msgbox "Failed to write authorized_keys." 8 50
