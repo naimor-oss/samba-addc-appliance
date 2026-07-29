@@ -55,6 +55,17 @@ verify() {
         rc=1
     fi
 
+    say "deploy-master hostname and cloud-init state contain no lab identity"
+    ssh_vm 'test "$(cat /etc/hostname)" = "samba-dc1" &&
+            ! grep -Fq "lab.test" /etc/hostname /etc/hosts &&
+            ! grep -R -Fq "lab.test" /var/lib/cloud/instance /var/lib/cloud/instances 2>/dev/null' || rc=1
+
+    say "image provenance identifies two clean source trees"
+    ssh_vm 'grep -Eq "^appliance-core-commit=[0-9a-f]{40}$" /etc/appliance-core.provenance &&
+            grep -qx "appliance-core-tree-state=clean" /etc/appliance-core.provenance &&
+            grep -Eq "^consumer-commit=[0-9a-f]{40}$" /etc/appliance-core.provenance &&
+            grep -qx "consumer-tree-state=clean" /etc/appliance-core.provenance' || rc=1
+
     say "network is alive through the lab router"
     ssh_vm 'ping -c 1 -W 2 10.10.10.1 >/dev/null' || rc=1
     ssh_vm 'getent hosts debian.org >/dev/null' || rc=1

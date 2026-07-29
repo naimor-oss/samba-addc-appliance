@@ -42,6 +42,7 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
+    [[ -f "$APPCORE_LIBS/timezone.sh"   ]] && source "$APPCORE_LIBS/timezone.sh"
 fi
 
 # info / yesno / die delegate to appliance-core's sized whiptail
@@ -100,11 +101,104 @@ check_root() {
     fi
 }
 
+readonly DETECT_FILE="${SAMBA_DETECT_FILE:-/var/lib/samba-init-detected.env}"
+
+_samba_detect_cache_value() {
+    local key="$1"
+    [[ -r "$DETECT_FILE" ]] || return 0
+    awk -F= -v key="$key" '
+        $1 == key {
+            value=substr($0, index($0, "=") + 1)
+            sub(/^"/, "", value); sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$DETECT_FILE"
+}
+
+# Canonical deployment context. appliance-core owns live IP, gateway, DHCP
+# resolver/domain, PTR, cache freshness, and source attribution.
+refresh_detected_context() {
+    APPCORE_DET_IP="" APPCORE_DET_GATEWAY="" APPCORE_DET_DHCP_DNS=""
+    APPCORE_DET_DHCP_DOMAIN="" APPCORE_DET_PTR_DOMAIN=""
+    APPCORE_DET_EFFECTIVE_DOMAIN=""
+    if command -v appcore_detect_net_init >/dev/null 2>&1; then
+        appcore_detect_net_init "$DETECT_FILE" >/dev/null 2>&1 || true
+    else
+        # Compatibility with images built before appliance-core detection
+        # was vendored. New releases always take the branch above.
+        APPCORE_DET_IP=$(_samba_detect_cache_value DET_IP)
+        APPCORE_DET_GATEWAY=$(_samba_detect_cache_value DET_GATEWAY)
+        APPCORE_DET_DHCP_DNS=$(_samba_detect_cache_value DET_DHCP_DNS)
+        APPCORE_DET_DHCP_DOMAIN=$(_samba_detect_cache_value DET_DHCP_DOMAIN)
+        APPCORE_DET_PTR_DOMAIN=$(_samba_detect_cache_value DET_PTR_DOMAIN)
+        APPCORE_DET_EFFECTIVE_DOMAIN="${APPCORE_DET_DHCP_DOMAIN:-$APPCORE_DET_PTR_DOMAIN}"
+    fi
+}
+
+# Samba adds AD-specific SRV discovery only when a domain-operation screen
+# needs it. Routine status rendering stays fast when DNS is unavailable.
+refresh_samba_domain_context() {
+    refresh_detected_context
+    SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""
+    local domain dc cached_realm cached_dc
+    for domain in "${APPCORE_DET_DHCP_DOMAIN:-}" "${APPCORE_DET_PTR_DOMAIN:-}"; do
+        [[ -n "$domain" ]] || continue
+        dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${domain}" 2>/dev/null \
+            | awk 'NR==1 {sub(/\.$/,"",$4); print $4}') || dc=""
+        if [[ -n "$dc" ]]; then
+            SAMBA_DET_AD_DC="$dc"
+            SAMBA_DET_AD_REALM="$domain"
+            break
+        fi
+    done
+
+    # A transient SRV failure may reuse the prior DC only for the same
+    # effective realm. It must never carry a lab/previous-network DC into
+    # a different deployment.
+    if [[ -z "$SAMBA_DET_AD_DC" && -n "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" ]]; then
+        cached_realm=$(_samba_detect_cache_value SAMBA_DET_AD_REALM)
+        cached_dc=$(_samba_detect_cache_value SAMBA_DET_AD_DC)
+        [[ -z "$cached_realm" ]] && cached_realm=$(_samba_detect_cache_value DET_AD_REALM)
+        [[ -z "$cached_dc" ]] && cached_dc=$(_samba_detect_cache_value DET_AD_DC)
+        local cached_realm_lc effective_realm_lc
+        cached_realm_lc=$(printf '%s' "$cached_realm" | tr '[:upper:]' '[:lower:]')
+        effective_realm_lc=$(printf '%s' "$APPCORE_DET_EFFECTIVE_DOMAIN" | tr '[:upper:]' '[:lower:]')
+        if [[ "$cached_realm_lc" == "$effective_realm_lc" ]]; then
+            SAMBA_DET_AD_REALM="$cached_realm"
+            SAMBA_DET_AD_DC="$cached_dc"
+        fi
+    fi
+
+    export SAMBA_DET_AD_DC SAMBA_DET_AD_REALM
+}
+
+set_domain_defaults() {
+    refresh_samba_domain_context
+    SAMBA_DEFAULT_REALM=$(printf '%s' "$APPCORE_DET_EFFECTIVE_DOMAIN" | tr '[:lower:]' '[:upper:]')
+    SAMBA_DEFAULT_FORWARDER="${APPCORE_DET_DHCP_DNS%% *}"
+    SAMBA_DEFAULT_DC="$SAMBA_DET_AD_DC"
+    export SAMBA_DEFAULT_REALM SAMBA_DEFAULT_FORWARDER SAMBA_DEFAULT_DC
+}
+
 get_hostname()  { hostname -s 2>/dev/null || echo "(not set)"; }
 get_fqdn()      { hostname -f 2>/dev/null || echo "(not set)"; }
-get_domain()    { dnsdomainname 2>/dev/null || echo "(not set)"; }
-get_ip()        { ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+[.\d/]+' | head -1 || echo "(not set)"; }
-get_gateway()   { ip route show default | awk '/default/{print $3}' | head -1 || echo "(not set)"; }
+get_domain() {
+    if is_provisioned; then
+        get_realm | tr '[:upper:]' '[:lower:]'
+        return
+    fi
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_EFFECTIVE_DOMAIN:-(not detected)}"
+}
+get_ip() {
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_IP:-(not set)}"
+}
+get_gateway() {
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_GATEWAY:-(not set)}"
+}
 get_iface()     { ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1 || \
                   ip link show | awk -F: '/^[0-9]+:/{if($2!~"lo") print $2}' | tr -d ' ' | head -1; }
 
@@ -398,7 +492,7 @@ config_hostname() {
     fi
 
     # The actual rename flow lives in the appliance-core hostname.sh
-    # lib (live DHCP/PTR/dnsdomainname domain detection, NetBIOS-rules
+    # lib (canonical DHCP/PTR domain detection, NetBIOS-rules
     # short-name validation, safe /etc/hosts rewrite). The post-provision
     # guard above is the only product-specific bit; everything else is
     # shared with smb-proxy and any future appliance.
@@ -407,7 +501,8 @@ config_hostname() {
         return
     fi
 
-    if appcore_hostname_change_tui; then
+    refresh_detected_context
+    if appcore_hostname_change_tui "" "${APPCORE_DET_EFFECTIVE_DOMAIN:-}"; then
         info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended so all services pick it up."
     fi
 }
@@ -428,28 +523,10 @@ get_addr_source() {
 }
 
 get_current_dns() {
-    local dns
-    dns=$(resolvectl dns 2>/dev/null \
-        | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) printf "%s ", $i}' \
-        | sed 's/ *$//')
-    if [[ -n "$dns" ]]; then
-        printf '%s\n' "$dns"
+    refresh_detected_context
+    if [[ -n "${APPCORE_DET_DHCP_DNS:-}" ]]; then
+        printf '%s\n' "$APPCORE_DET_DHCP_DNS"
         return
-    fi
-
-    # First boot records DHCP's upstream resolvers before any TUI
-    # transition. Keep that useful value if systemd-resolved has no
-    # live per-link result at the moment the dialog opens.
-    if [[ -f /var/lib/samba-init-detected.env ]]; then
-        dns=$(awk -F= '$1 == "DET_DHCP_DNS" {
-            value=substr($0, index($0, "=") + 1)
-            sub(/^"/, "", value); sub(/"$/, "", value)
-            print value; exit
-        }' /var/lib/samba-init-detected.env)
-        if [[ -n "$dns" ]]; then
-            printf '%s\n' "$dns"
-            return
-        fi
     fi
 
     awk '/^nameserver[[:space:]]/ { print $2; exit }' \
@@ -473,7 +550,37 @@ config_network() {
         "$(get_current_dns)"
 }
 
-config_timezone() { dpkg-reconfigure tzdata; }
+config_timezone() {
+    local current suggested="" failure="" selected prompt
+    current=$(timedatectl show --property=Timezone --value 2>/dev/null || echo Etc/UTC)
+    current="${current:-Etc/UTC}"
+    if command -v appcore_timezone_suggest >/dev/null 2>&1; then
+        if appcore_timezone_suggest >/dev/null; then
+            suggested="$APPCORE_TIMEZONE_SUGGESTION"
+        else
+            failure="$APPCORE_TIMEZONE_ERROR"
+        fi
+    else
+        failure="automatic suggestion unavailable on this image"
+    fi
+
+    prompt="Current timezone: ${current}"
+    if [[ -n "$suggested" ]]; then
+        prompt+="\nDetected suggestion: ${suggested}"
+    else
+        prompt+="\n${failure}"
+    fi
+    prompt+="\n\nEnter an IANA timezone (for example America/Los_Angeles or Etc/UTC):"
+
+    selected=$(whiptail --title "Timezone" --inputbox "$prompt" \
+        14 "$WT_WIDTH" "${suggested:-$current}" 3>&1 1>&2 2>&3) || return
+    if ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$selected"; then
+        info "Unknown timezone: ${selected}\n\nUse a value shown by: timedatectl list-timezones"
+        return
+    fi
+    timedatectl set-timezone "$selected"
+    info "Timezone is now ${selected}."
+}
 
 config_updates() {
     local choice
@@ -675,9 +782,10 @@ menu_domain_ops() {
 }
 
 collect_domain_info() {
+    set_domain_defaults
     DC_REALM=$(whiptail --inputbox \
         "AD Realm (UPPERCASE DNS domain name).\n\nExamples: HOME.LAN, CORP.CONTOSO.COM\nDo NOT use .local" \
-        12 64 "" 3>&1 1>&2 2>&3) || return 1
+        12 64 "$SAMBA_DEFAULT_REALM" 3>&1 1>&2 2>&3) || return 1
     [[ -z "$DC_REALM" ]] && return 1
     DC_REALM="${DC_REALM^^}"
     [[ "$DC_REALM" == *.LOCAL ]] && { info ".LOCAL conflicts with mDNS."; return 1; }
@@ -688,7 +796,7 @@ collect_domain_info() {
     DC_NETBIOS="${DC_NETBIOS^^}"
 
     DC_DNS_FORWARDER=$(whiptail --inputbox "DNS forwarder (upstream DNS for external names):" \
-        10 64 "1.1.1.1" 3>&1 1>&2 2>&3) || return 1
+        10 64 "${SAMBA_DEFAULT_FORWARDER:-1.1.1.1}" 3>&1 1>&2 2>&3) || return 1
 
     return 0
 }
@@ -1051,7 +1159,7 @@ domain_join_dc() {
 
     local existing_dc
     existing_dc=$(whiptail --inputbox "FQDN or IP of existing DC to replicate from:" \
-        10 64 "" 3>&1 1>&2 2>&3) || return
+        10 64 "${SAMBA_DEFAULT_DC:-}" 3>&1 1>&2 2>&3) || return
 
     local dc_ip
     if ! dc_ip=$(resolve_dc_ip "$existing_dc"); then
@@ -1101,7 +1209,7 @@ domain_join_rodc() {
 
     local existing_dc
     existing_dc=$(whiptail --inputbox "FQDN or IP of writable DC:" \
-        10 64 "" 3>&1 1>&2 2>&3) || return
+        10 64 "${SAMBA_DEFAULT_DC:-}" 3>&1 1>&2 2>&3) || return
 
     local dc_ip
     if ! dc_ip=$(resolve_dc_ip "$existing_dc"); then
@@ -2922,6 +3030,10 @@ USAGE
 #===============================================================================
 # ENTRY
 #===============================================================================
+if [[ "${SAMBA_SCONFIG_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0
+fi
+
 check_root
 
 case "${1:-}" in

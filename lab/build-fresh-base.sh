@@ -24,6 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
 
 # Defaults intentionally match lab/samba.env so a flagless invocation
 # produces samba-dc1 ready for the existing scenarios.
@@ -91,6 +92,29 @@ ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 ssh_vm()   { ssh -J "${HV_USER}@${HV_HOST}" \
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  "${VM_USER}@${VM_IP}" "$@"; }
+
+require_clean_source() {
+    local repo="$1" label="$2" dirty
+    git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        say "$label is not a git worktree: $repo"
+        exit 1
+    }
+    dirty=$(git -C "$repo" status --porcelain --untracked-files=normal)
+    if [[ -n "$dirty" ]]; then
+        say "$label has uncommitted source changes; refusing a non-reproducible release build"
+        printf '%s\n' "$dirty"
+        exit 1
+    fi
+}
+
+# Resolve both source identities before touching the lab VM. Files copied
+# below are therefore guaranteed to match the commits written into the image.
+require_clean_source "$REPO_DIR" "samba-addc-appliance"
+require_clean_source "$APPCORE_REPO" "appliance-core"
+SAMBA_BUILD_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD)"
+say "  samba-addc-appliance source commit: $SAMBA_BUILD_COMMIT"
+say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
 
 # 0. Tear down any existing VM first. The DVD attachment of the prior seed
 # ISO (mounted on the dead VM) locks the file across the SMB share — if we
@@ -172,7 +196,6 @@ scp -J "${HV_USER}@${HV_HOST}" \
 # repo. prepare-image.sh §18b looks for them at /tmp/lib/. The
 # appliance-core checkout lives at $REPO_DIR/../appliance-core per
 # REPO-SPLIT.md.
-APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
 if [[ ! -d "$APPCORE_REPO/lib" ]]; then
     say "appliance-core lib/ not found at $APPCORE_REPO/lib"
     say "set \$APPCORE_REPO if the sibling lives elsewhere"
@@ -184,13 +207,9 @@ scp -J "${HV_USER}@${HV_HOST}" -r \
     "${VM_USER}@${VM_IP}:/tmp/"
 
 step "6. run prepare-image.sh on $VM_NAME"
-# Compute the appliance-core source-tree commit on the Mac and pass
-# through; the appliance image has no git, so this is the only correct
-# way to record provenance. See appliance-core/prepare-image.sh §12 and
-# decisions/0002-appliance-core.md §"Versioning + identity".
-APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
-if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare-image.sh"; then
+# The appliance has no git, so source identities must cross the build
+# boundary explicitly.
+if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' SAMBA_BUILD_COMMIT='$SAMBA_BUILD_COMMIT' SOURCE_TREE_STATE=clean bash /tmp/prepare-image.sh"; then
     say "prepare-image.sh failed"
     ssh_vm 'sudo tail -30 /var/log/samba-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1

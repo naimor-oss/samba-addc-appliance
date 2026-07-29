@@ -45,6 +45,13 @@ If you don't already have one, or want a fresh master with the latest
 lab/build-fresh-base.sh -f
 ```
 
+The build refuses to start unless both `samba-addc-appliance` and the
+sibling `appliance-core` checkout are clean Git worktrees. The resulting
+`/etc/appliance-core.provenance` records both commits and their clean
+state. Before the `deploy-master` checkpoint, preparation replaces the
+lab FQDN with the neutral short hostname `samba-dc1` and removes the
+cloud-init build seed.
+
 That produces both `deploy-master` (host-agnostic, ship-this-one) and
 `golden-image` (Hyper-V-tailored, used by the test scenarios). About 7
 minutes from a warm cache.
