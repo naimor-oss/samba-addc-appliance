@@ -238,6 +238,7 @@ apt-get install -y \
     rsync \
     bash-completion \
     locales-all \
+    dialog \
     whiptail \
     nftables \
     ldap-utils
@@ -1753,21 +1754,30 @@ read_pasted_ssh_key() {
 }
 
 read_typed_ed25519_key() {
-    local body="" chunk part start end
+    local body="" chunk part start end error prompt
     for part in 1 2 3 4; do
         start=$(( (part - 1) * 17 + 1 ))
         end=$(( part * 17 ))
+        error=""
         while true; do
-            chunk=$(whiptail --title "Ed25519 part ${part}/4" \
-                --inputbox \
-                "Type characters ${start}-${end} of the 68-character text after \"ssh-ed25519 \".\n\nRuler: 12345678901234567\nEnter exactly 17 characters. Do not type spaces or the optional comment.\n\nCompleted: ${#body}/68 characters" \
-                15 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return 1
+            if [[ -n "$error" ]]; then
+                prompt="${error}\nRetry characters ${start}-${end}; no spaces or comment."
+            else
+                prompt="Type characters ${start}-${end} from the text after \"ssh-ed25519 \".\nEnter exactly 17 characters; no spaces or comment."
+            fi
+            prompt+="\nAllowed: A-Z, a-z, 0-9, +, /\nCompleted: ${#body}/68 characters"
+            chunk=$(dialog --stdout --title "Ed25519 part ${part}/4" \
+                --form "$prompt" 14 "$WT_WIDTH" 3 \
+                "12345678901234567" 1 0 \
+                "" 2 0 17 68) || return 1
             if [[ "$chunk" =~ ^[A-Za-z0-9+/]{17}$ ]]; then
                 break
             fi
-            whiptail --msgbox \
-                "That part must contain exactly 17 base64 characters:\nA-Z, a-z, 0-9, +, or /." \
-                10 "$WT_WIDTH"
+            if [[ ${#chunk} -ne 17 ]]; then
+                error="Error: enter exactly 17 characters."
+            else
+                error="Error: use only A-Z, a-z, 0-9, +, or /."
+            fi
         done
         body+="$chunk"
     done

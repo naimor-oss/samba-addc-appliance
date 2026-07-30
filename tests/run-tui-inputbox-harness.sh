@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
-# Run the real whiptail input-box harness locally or in disposable Debian 13.
+# Run the real console-dialog harness locally or in disposable Debian 13.
 
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 HARNESS="${REPO_DIR}/tests/tui-inputbox-harness.sh"
 
-if command -v whiptail >/dev/null 2>&1 &&
+if command -v dialog >/dev/null 2>&1 &&
+   command -v whiptail >/dev/null 2>&1 &&
    command -v tmux >/dev/null 2>&1 &&
    command -v ssh-keygen >/dev/null 2>&1; then
     exec "$HARNESS"
 fi
 
 command -v docker >/dev/null 2>&1 || {
-    echo "whiptail/tmux are unavailable and Docker was not found" >&2
+    echo "dialog/whiptail/tmux are unavailable and Docker was not found" >&2
     exit 2
 }
 
@@ -29,7 +30,7 @@ docker run --rm \
     debian:13-slim \
     bash -lc \
     'apt-get update -qq &&
-     apt-get install -y -qq openssh-client tmux whiptail >/dev/null &&
+     apt-get install -y -qq dialog openssh-client tmux whiptail >/dev/null &&
      /work/tests/tui-inputbox-harness.sh'
 
 echo "Host screen-capture directory: $artifact_dir"

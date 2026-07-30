@@ -45,10 +45,12 @@ tests/run-tui-inputbox-harness.sh
 ```
 
 The harness extracts the actual generated `samba-init`, opens its real
-`whiptail` input boxes in an 80x24 `tmux` PTY, enters every Ed25519 key chunk
-separately, and verifies that both typed and pasted keys are returned exactly.
-It also saves a text capture of each rendered box. On non-Linux development
-hosts the wrapper runs the same harness in a disposable Debian 13 container.
+console dialogs in an 80x24 `tmux` PTY, and enters every Ed25519 key chunk
+separately. It asserts that the ruler and input cursor are adjacent and
+column-aligned, exercises overlength and invalid-character retries, and
+verifies that both typed and pasted keys are returned exactly. It also saves a
+text capture of each rendered box. On non-Linux development hosts the wrapper
+runs the same harness in a disposable Debian 13 container.
 
 ## Existing Scenarios
 

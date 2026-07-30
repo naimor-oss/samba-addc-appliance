@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Render and drive samba-init's real whiptail SSH-key input boxes in a PTY.
+# Render and drive samba-init's real SSH-key dialogs in a PTY.
 
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PREPARE="${REPO_DIR}/prepare-image.sh"
-for command_name in awk grep ssh-keygen tmux whiptail; do
+for command_name in awk dialog grep ssh-keygen tmux whiptail; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing required command: $command_name" >&2
         exit 2
@@ -85,6 +85,31 @@ wait_for_result() {
     return 1
 }
 
+assert_ruler_alignment() {
+    local session="$1" screen="$2"
+    local ruler_position cursor_position ruler_row ruler_col cursor_row cursor_col
+    ruler_position=$(awk '
+        index($0, "12345678901234567") {
+            print NR, index($0, "12345678901234567")
+            exit
+        }
+    ' "$screen")
+    cursor_position=$(tmux -L "$socket" display-message -p -t "$session" \
+        '#{cursor_y} #{cursor_x}')
+    read -r ruler_row ruler_col <<< "$ruler_position"
+    read -r cursor_row cursor_col <<< "$cursor_position"
+    cursor_row=$((cursor_row + 1))
+    cursor_col=$((cursor_col + 1))
+    if [[ -z "${ruler_row:-}" ||
+          $cursor_row -ne $((ruler_row + 1)) ||
+          $cursor_col -ne $ruler_col ]]; then
+        echo "ruler is not directly aligned above the input field" >&2
+        echo "ruler=${ruler_row:-missing}:${ruler_col:-missing} cursor=${cursor_row}:${cursor_col}" >&2
+        cat "$screen" >&2
+        return 1
+    fi
+}
+
 start_function() {
     local session="$1" function_name="$2" result="$3"
     local runner="${work_dir}/run-${session}.sh"
@@ -108,12 +133,27 @@ send_literal() {
 typed_session="typed-key"
 typed_result="${work_dir}/typed-result"
 start_function "$typed_session" read_typed_ed25519_key "$typed_result"
+initial_screen="${artifact_dir}/typed-part-1-initial.txt"
+wait_for_screen "$typed_session" "Ed25519 part 1/4" "$initial_screen"
+assert_ruler_alignment "$typed_session" "$initial_screen"
+send_literal "$typed_session" "${key_body:0:17}X"
+retry_screen="${artifact_dir}/typed-part-1-retry.txt"
+wait_for_screen "$typed_session" "Error: enter exactly 17 characters" "$retry_screen"
+grep -Fq "Ed25519 part 1/4" "$retry_screen"
+assert_ruler_alignment "$typed_session" "$retry_screen"
+send_literal "$typed_session" "${key_body:0:16}!"
+character_retry_screen="${artifact_dir}/typed-part-1-character-retry.txt"
+wait_for_screen "$typed_session" "Error: use only A-Z, a-z, 0-9, +, or /" \
+    "$character_retry_screen"
+grep -Fq "Ed25519 part 1/4" "$character_retry_screen"
+assert_ruler_alignment "$typed_session" "$character_retry_screen"
+
 for part in 1 2 3 4; do
     start=$(( (part - 1) * 17 ))
     chunk="${key_body:start:17}"
     screen="${artifact_dir}/typed-part-${part}.txt"
     wait_for_screen "$typed_session" "Ed25519 part ${part}/4" "$screen"
-    grep -Fq "Ruler: 12345678901234567" "$screen"
+    assert_ruler_alignment "$typed_session" "$screen"
     send_literal "$typed_session" "$chunk"
 done
 wait_for_result "$typed_session" "$typed_result"
@@ -129,5 +169,5 @@ send_literal "$paste_session" "$public_key"
 wait_for_result "$paste_session" "$paste_result"
 [[ "$(cat "$paste_result")" == "$public_key" ]]
 
-echo "PASS: real whiptail paste and four-part Ed25519 input boxes"
+echo "PASS: real paste and four-part Ed25519 console dialogs"
 echo "Rendered screens: $artifact_dir"

@@ -23,7 +23,7 @@ verify() {
     # Outer single quotes preserve the literal $c through ssh; the \$c
     # below survives the remote shell's parsing of the double-quoted
     # bash -lc argument and is only expanded by bash -lc's loop.
-    out=$(ssh_vm 'sudo bash -lc "for c in samba-tool samba smbclient ldapsearch nft pwsh chronyd dig ssh-keygen; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
+    out=$(ssh_vm 'sudo bash -lc "for c in samba-tool samba smbclient ldapsearch nft pwsh chronyd dig ssh-keygen dialog; do printf \"%s \" \"\$c\"; command -v \"\$c\" || exit 1; done"' 2>&1 || true)
     echo "$out"
     if grep -qi 'not found' <<< "$out" || ! grep -q 'samba-tool' <<< "$out"; then
         rc=1
