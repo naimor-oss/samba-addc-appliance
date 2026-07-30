@@ -10,6 +10,11 @@ setup() {
 @test "release preparation neutralizes the lab hostname and cloud-init seed" {
     grep -q 'appcore_hostname_apply_safe "samba-dc1" ""' "$PREPARE"
     grep -q 'cloud-init clean --logs --seed' "$PREPARE"
+    grep -q 'DEFERRED_REMOVE_PKGS=(cloud-init eject)' "$PREPARE"
+    grep -q 'apt-mark manual "$pkg"' "$PREPARE"
+    clean_line="$(grep -n 'cloud-init clean --logs --seed' "$PREPARE" | cut -d: -f1)"
+    purge_line="$(grep -n 'apt-get purge -y "${DEFERRED_REMOVE_PKGS\[@\]}"' "$PREPARE" | cut -d: -f1)"
+    [ "$clean_line" -lt "$purge_line" ]
     grep -q 'build-time FQDN remains active after generalization' "$PREPARE"
 }
 
