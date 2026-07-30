@@ -171,12 +171,14 @@ else
     say "wrote $VHDX_OUT ($(du -sh "$VHDX_OUT" | cut -f1))"
 
     step "3. qemu-img convert vhdx -> qcow2"
-    qemu-img convert -p -O qcow2 -o compat=1.1 "$VHDX_OUT" "$QCOW2_OUT"
+    qemu-img convert -U -p -O qcow2 -o compat=1.1 "$VHDX_OUT" "$QCOW2_OUT"
     say "wrote $QCOW2_OUT ($(du -sh "$QCOW2_OUT" | cut -f1))"
 fi
 
 step "4. qemu-img convert vhdx -> vmdk (streamOptimized for OVA)"
-qemu-img convert -p -O vmdk -o subformat=streamOptimized "$VHDX_OUT" "$VMDK_OUT"
+# The exported VHDX is immutable, and -U avoids unsupported byte-range locks
+# when ISO_DIR_MAC is a macOS SMB mount.
+qemu-img convert -U -p -O vmdk -o subformat=streamOptimized "$VHDX_OUT" "$VMDK_OUT"
 say "wrote $VMDK_OUT ($(du -sh "$VMDK_OUT" | cut -f1))"
 
 step "5. write a minimal .vmx for ovftool"
