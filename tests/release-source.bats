@@ -4,6 +4,7 @@ setup() {
     REPO_DIR="${BATS_TEST_DIRNAME}/.."
     PREPARE="${REPO_DIR}/prepare-image.sh"
     BUILD="${REPO_DIR}/lab/build-fresh-base.sh"
+    EXPORT="${REPO_DIR}/lab/export-deploy-master.sh"
 }
 
 @test "release preparation neutralizes the lab hostname and cloud-init seed" {
@@ -32,6 +33,18 @@ setup() {
     grep -q '12 64 "$SAMBA_DEFAULT_REALM"' "$sconfig"
     grep -q '10 64 "${SAMBA_DEFAULT_FORWARDER:-1.1.1.1}"' "$sconfig"
     grep -q '10 64 "${SAMBA_DEFAULT_DC:-}"' "$sconfig"
+}
+
+@test "canonical OVA is generic, portable, and refuses version collisions" {
+    grep -q 'OVA_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.ova"' "$EXPORT"
+    grep -q 'ide0:0.deviceType = "disk"' "$EXPORT"
+    grep -q 'ethernet0.virtualDev = "e1000"' "$EXPORT"
+    ! grep -q 'scsi0.virtualDev' "$EXPORT"
+    ! grep -q 'vmxnet3' "$EXPORT"
+    grep -q 'artifact directory already exists' "$EXPORT"
+    grep -q -- '--ova-only' "$EXPORT"
+    grep -q 'PACKAGE_TMP=$(mktemp -d' "$EXPORT"
+    grep -q 'trap cleanup_package_tmp EXIT' "$EXPORT"
 }
 
 @test "generated firstboot, initial-setup, and MOTD scripts parse" {

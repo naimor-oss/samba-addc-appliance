@@ -62,6 +62,16 @@ minutes from a warm cache.
 lab/export-deploy-master.sh
 ```
 
+For a single portable exchange archive without parallel disk formats:
+
+```bash
+lab/export-deploy-master.sh --ova-only
+```
+
+OVA-only mode writes the generic `.ova` and `SHA256SUMS`. Its
+streamOptimized VMDK is created in a temporary directory and removed
+after ovftool bundles it into the archive.
+
 Defaults: VM=`samba-dc1`, snapshot=`deploy-master`, version=today's date
 (`Y.M.D`). Override with `-V 2026.04.27` to set a specific version
 string, or `-s some-other-snapshot` to export a different checkpoint.
@@ -75,8 +85,9 @@ The script:
 3. The .vhdx is copied to `dist/<version>/` on the Mac and converted by
    `qemu-img` into qcow2 (compat=1.1) and streamOptimized vmdk.
 4. A minimal .vmx (vmx-19, EFI, Secure Boot off, 2 vCPU, 2 GB RAM,
-   pvscsi disk + vmxnet3 NIC, debian12-64 guestOS) is fed to ovftool to
-   bundle the vmdk into a sha256-manifested .ova.
+   IDE disk + E1000 NIC, debian12-64 guestOS) is fed to ovftool to
+   bundle the vmdk into one generic, sha256-manifested .ova. These
+   conservative virtual devices are broadly supported by OVF consumers.
 5. `shasum -a 256` over all four artifacts produces `SHA256SUMS`.
 6. The host-side export tree is removed (use `--keep-export` to retain
    it for inspection).
@@ -89,8 +100,8 @@ The script:
 /Volumes/Data/Developer/Debian-SAMBA/ovftool/ovftool dist/<ver>/<name>.ova
 ```
 
-Expected: 1 disk (20 GB capacity, ~1.4 GB sparse), 2 vCPU, 2 GB RAM,
-vmxnet3 NIC, vmx-19, debian12_64guest.
+Expected: 1 IDE disk (20 GB capacity, ~1.4 GB sparse), 2 vCPU, 2 GB RAM,
+E1000 NIC, vmx-19, debian12_64guest.
 
 ### Verify before distribution
 
