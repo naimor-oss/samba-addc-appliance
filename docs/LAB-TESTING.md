@@ -35,6 +35,21 @@ The generic pipeline (from `lab-kit`) is:
 7. `post_hook`.
 8. Transcript is written to `test-results/<scenario>-<timestamp>.log`.
 
+### Initial-setup input boxes
+
+The headless scenario commands remain the primary way to test appliance
+behavior. For console-only interaction and rendering, run:
+
+```bash
+tests/run-tui-inputbox-harness.sh
+```
+
+The harness extracts the actual generated `samba-init`, opens its real
+`whiptail` input boxes in an 80x24 `tmux` PTY, enters every Ed25519 key chunk
+separately, and verifies that both typed and pasted keys are returned exactly.
+It also saves a text capture of each rendered box. On non-Linux development
+hosts the wrapper runs the same harness in a disposable Debian 13 container.
+
 ## Existing Scenarios
 
 The implemented scenarios cover the full join + provision + DFS path

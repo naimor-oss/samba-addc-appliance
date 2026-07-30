@@ -297,9 +297,10 @@ need one of them to work:
    deployed VM and you land directly in `samba-init`, a whiptail-driven
    setup wizard. From there you can configure the network (DHCP or
    static), change the password, add your own SSH public key, set the
-   hostname, and view the `samba-firstboot` log — all without any
-   network connectivity. This is the path to use when DHCP didn't work
-   on the deployment network and SSH therefore can't reach the VM.
+   hostname and timezone, and view the `samba-firstboot` log — all
+   without any network connectivity. This is the path to use when DHCP
+   didn't work on the deployment network and SSH therefore can't reach
+   the VM.
 
 ### The TTY1 setup wizard
 
@@ -317,7 +318,8 @@ Wizard menu:
 | 3 | Change debadmin password | Required before "Mark setup complete" succeeds |
 | 4 | Add an SSH authorized_keys entry | Paste a complete key, or type an Ed25519 key as four validated 17-character parts; fingerprint is confirmed before appending |
 | 5 | Set hostname | NetBIOS-compatible (1-15 chars, starts with a letter) |
-| 6 | Show samba-firstboot log | Diagnostics from the host-tailoring step |
+| 6 | Set timezone | Prefers validated DHCP option 101; otherwise offers a bounded IP-geolocation suggestion |
+| 7 | Show samba-firstboot log | Diagnostics from the host-tailoring step |
 | S | Drop to a root shell | Escape hatch for when the wizard isn't enough |
 | D | Mark setup complete and proceed to login | Refused while default password is still active |
 

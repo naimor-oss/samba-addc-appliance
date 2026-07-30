@@ -414,6 +414,17 @@ makestep 1.0 3
 #allow 192.168.0.0/16   # enabled by samba-sconfig after provision/join
 CHRONEOF
 
+# Request RFC 4833 option 101 without enabling networkd's UseTimezone.
+# The latter would apply an untrusted DHCP value automatically; samba-init
+# and samba-sconfig instead validate the lease value and offer it as a
+# visible, operator-confirmed suggestion.
+log "Enabling DHCP timezone suggestions..."
+install -d -m 0755 /etc/systemd/network/10-netplan-primary.network.d
+cat > /etc/systemd/network/10-netplan-primary.network.d/10-timezone-request.conf << 'TZREQUESTEOF'
+[DHCPv4]
+RequestOptions=101
+TZREQUESTEOF
+
 #===============================================================================
 # 16. BACKUP NSSWITCH.CONF
 #===============================================================================
@@ -1747,7 +1758,7 @@ read_typed_ed25519_key() {
         start=$(( (part - 1) * 17 + 1 ))
         end=$(( part * 17 ))
         while true; do
-            chunk=$(whiptail --title "Type Ed25519 key — part ${part} of 4" \
+            chunk=$(whiptail --title "Ed25519 part ${part}/4" \
                 --inputbox \
                 "Type characters ${start}-${end} of the 68-character text after \"ssh-ed25519 \".\n\nRuler: 12345678901234567\nEnter exactly 17 characters. Do not type spaces or the optional comment.\n\nCompleted: ${#body}/68 characters" \
                 15 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return 1
@@ -2079,6 +2090,12 @@ action_quit() {
     sleep 1
     exec /bin/bash --login
 }
+
+# Tests extract and source this generated script so they exercise its real
+# functions. Installed copies never set this variable.
+if [[ "${SAMBA_INIT_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # Outer menu loop. Layout target: ≤24 lines on a fresh boot console so
 # nothing scrolls off the top of an 80x24 VT.

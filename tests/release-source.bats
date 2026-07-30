@@ -34,6 +34,11 @@ setup() {
     grep -q 'SAMBA_DET_AD_DC=' "$PREPARE"
 }
 
+@test "prepared image requests DHCP timezone data without applying it automatically" {
+    grep -q 'RequestOptions=101' "$PREPARE"
+    ! grep -q 'UseTimezone=true' "$PREPARE"
+}
+
 @test "domain-operation prompts consume the detected defaults" {
     sconfig="${REPO_DIR}/samba-sconfig.sh"
     grep -q '12 64 "$SAMBA_DEFAULT_REALM"' "$sconfig"
