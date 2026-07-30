@@ -51,7 +51,8 @@ setup() {
     grep -q -- '--ova-only' "$EXPORT"
     grep -q 'PACKAGE_TMP=$(mktemp -d' "$EXPORT"
     grep -q 'trap cleanup_package_tmp EXIT' "$EXPORT"
-    [ "$(grep -c 'qemu-img convert -U' "$EXPORT")" -eq 2 ]
+    [ "$(grep -c 'qemu-img convert --image-opts -U' "$EXPORT")" -eq 2 ]
+    [ "$(grep -c 'file.locking=off' "$EXPORT")" -eq 2 ]
 }
 
 @test "generated firstboot, initial-setup, and MOTD scripts parse" {
