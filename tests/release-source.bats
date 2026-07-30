@@ -18,6 +18,7 @@ setup() {
     grep -q 'require_clean_source "$APPCORE_REPO"' "$BUILD"
     grep -q "SAMBA_BUILD_COMMIT=" "$BUILD"
     grep -q "SOURCE_TREE_STATE=clean" "$BUILD"
+    [ "$(grep -c -- '-o IdentitiesOnly=yes -o IdentityAgent=none' "$BUILD")" -eq 5 ]
     grep -q "consumer-commit=%s" "$PREPARE"
     grep -q "consumer-tree-state=%s" "$PREPARE"
 }
