@@ -33,7 +33,8 @@ verify() {
     ssh_vm 'grep -q "^read_pasted_ssh_key()" /usr/local/sbin/samba-init &&
             grep -q "^read_typed_ed25519_key()" /usr/local/sbin/samba-init &&
             grep -q "KVM Console Paste" /usr/local/sbin/samba-init &&
-            grep -q "Ruler: 12345678901234567" /usr/local/sbin/samba-init &&
+            grep -Fq "dialog --stdout --title \"Ed25519 part" /usr/local/sbin/samba-init &&
+            grep -Fq "\"12345678901234567\" 1 0" /usr/local/sbin/samba-init &&
             grep -q "ssh-keygen -lf" /usr/local/sbin/samba-init' || rc=1
 
     say "Samba AD DC is not provisioned yet"
