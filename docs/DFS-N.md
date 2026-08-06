@@ -1,9 +1,8 @@
 # DFS-N on the Samba AD DC Appliance — Design
 
-Design for adding **DFS Namespace (DFS-N)** support to
-`samba-addc-appliance` so the appliance can serve as a tertiary
-namespace target alongside two physical Windows Server primaries
-and a Synology read-only fallback.
+Design for the Samba DC's two distinct **DFS Namespace (DFS-N)**
+responsibilities: preserving existing domain namespace roots on every
+DC, and optionally serving as an additional namespace target.
 
 This document is the corrected, project-aligned successor to the
 draft sketch at `../../add-dfsn-to-samba-addc.md`. The draft is
@@ -11,30 +10,37 @@ preserved for historical reference; this file is authoritative.
 
 ## 1. What this is and is not
 
-**Is:** turning the Samba AD DC into a *namespace server* — i.e. a
-machine that responds to DFS referral requests for one or more
-domain-based namespaces by handing clients a list of folder
-targets (server\share). The metadata that drives those referrals
-lives in AD (`CN=Dfs-Configuration,CN=System,DC=…`) and replicates
-to this DC via normal AD replication. The Samba-side job is to
-materialize that metadata as MSDFS symlinks under a hosted share so
-Samba's existing `msdfs root` referral path can serve it.
+**Automatic root compatibility:** a client can select any AD DC when
+resolving `\\DOMAIN\Namespace`. Samba replicates the DFS objects but does
+not automatically declare matching shares, so an otherwise healthy join
+can break the namespace whenever the client selects the Samba DC. After
+provision or join, `samba-sconfig` reads every domain root and creates a
+managed `msdfs proxy` share pointing at its existing namespace servers.
+The five-minute timer keeps additions, removals, state, and target order
+converged.
+
+**Optional tertiary namespace server:** the Samba DC can also host a
+namespace tree. In this mode it reads replicated folder-link metadata and
+materializes MSDFS symlinks under a local `msdfs root` share. Windows
+administrators explicitly register that share as a low-priority root
+target.
 
 **Is not:** a DFS replication engine. Samba does not implement DFSR.
 Folder *content* is replicated by the Windows primaries (and copied
 to the Synology by some other mechanism the operator owns). This
 appliance only carries namespace metadata.
 
-**Is not:** a way to "promote" the appliance to tertiary status. The
+The automatic proxy mode is **not** a way to promote the DC to tertiary
+status and must not point back to itself. The
 priority of this DC as a namespace target is set on the Windows
 side via `Set-DfsnRootTarget -Priority`. Symlink target ordering
 within a single referral controls *folder-target* selection, which
 is a separate layer.
 
-## 2. Operator boundary (what Windows-side admins must do)
+## 2. Operator boundary for optional tertiary mode
 
-Before any of this matters on the Samba side, an admin on a Windows
-DC must:
+Automatic root compatibility requires no Windows-side registration.
+For the optional tertiary mode, an admin on a Windows DC must:
 
 1. Add this Samba DC as a namespace root target. The cmdlet is
    `New-DfsnRootTarget` — note `New-`, not `Add-`. (Folder targets
@@ -76,11 +82,15 @@ For each namespace `<NS>`, AD carries:
 | Object | DN under domain NC | Notes |
 | --- | --- | --- |
 | Namespace anchor | `CN=<NS>,CN=Dfs-Configuration,CN=System,<dn>` | `objectClass=msDFS-NamespaceAnchor`. **Note "Dfs-" not "Dfsn-".** |
-| Link container | `CN=<NS>,CN=<NS>,CN=Dfs-Configuration,CN=System,<dn>` | The namespace name appears twice. Holds the link objects as children. |
+| Namespace root | `CN=<NS>,CN=<NS>,CN=Dfs-Configuration,CN=System,<dn>` | `objectClass=msDFS-Namespacev2`. The namespace name appears twice; its target list drives the automatic root proxy and it holds link objects as children. |
 | Each link | `CN=link-<guid>,CN=<NS>,CN=<NS>,CN=Dfs-Configuration,...` | `objectClass=msDFS-Linkv2`. |
 
 The update tool's `ldbsearch` base is the link container — i.e. the
 doubled-`<NS>` form.
+
+Domain-v1 roots use `objectClass=fTDfs` and multivalued
+`remoteServerName` root targets. The automatic root proxy supports that
+format; the optional tertiary link-materialization path remains v2-only.
 
 `msDFS-LinkPathv2` is a UTF-8 string of the form `/<sub>/<link>`,
 forward-slash separator, **leading slash always present**. Example
@@ -123,10 +133,9 @@ strips a UTF-16 BOM, decodes UTF-16(LE/BE), strips the default
 
 The classes (`globalHigh`, `siteCostHigh`, `siteCostNormal`,
 `siteCostLow`, `globalLow`, `manual`) flow through to
-`samba-sconfig`'s ordering helper, which sorts by class first and
-then by an operator-supplied prefer-regex within each class. AD
-priority is authoritative; the regex is a tiebreaker within a
-priority bucket.
+`samba-sconfig`'s ordering helper, which sorts by class and rank first,
+then by an operator-supplied prefer-regex among equal-priority targets.
+AD priority is authoritative; the regex is only a tiebreaker.
 
 The helper lives at `/usr/local/sbin/samba-dfs-parse-targets`,
 installed by `prepare-image.sh`. Bash stays the orchestrator;
@@ -206,10 +215,10 @@ arguments (or reads them from a config file written by
    `msDFS-TargetListv2`. Output: TSV records, one per target
    (`priorityClass\tpriorityRank\tstate\tunc`).
 6. **Validate paths and targets** (see §7).
-7. **Order targets**: by AD-supplied priority class first, then
+7. **Order targets**: by AD-supplied priority class and rank first, then
    by an operator-supplied per-namespace preference list (regex
-   on UNC) for tie-breaking. Default tie-break: stable
-   alphabetical by UNC. The operator preference covers the
+   on UNC) for tie-breaking. Default tie-break: stable AD order.
+   The operator preference covers the
    "primaries first, Synology last" intent without hard-coding
    server names in the tool.
 8. **Materialize**:
@@ -343,6 +352,8 @@ DFS-N is part of the existing two-script appliance pattern, not a
 third top-level script.
 
 **Helpers** (private; underscore prefix per convention):
+the automatic root path is owned by `_dfs_sync_domain_root_proxies` and
+its parsing/rendering helpers. The optional tertiary path uses
 `_dfs_get_base_dn`, `_dfs_normalize_link_path`,
 `_dfs_validate_target_unc`, `_dfs_unwrap_ldif`, `_dfs_render_targets`,
 `_dfs_order_targets`, `_dfs_write_symlink`, `_dfs_prune`,
@@ -355,11 +366,12 @@ top-level usage):
 
 | Subcommand | Inputs | Effect |
 | --- | --- | --- |
+| `dfs-root-sync` | — | Immediately converges the automatic root-proxy block from replicated AD. Provision/join also enables its separate five-minute timer. |
 | `dfs-init` | `SC_DFS_ROOT`, `SC_DFS_SHARE` (env) | Writes `/etc/samba/conf.d/dfs-root.conf`, inserts `include = …` into `[global]`, drops the global sentinel. Reload-config. |
 | `dfs-configure NS [NS…]` | positional namespaces, `SC_DFS_PREFER` (env) | Writes `/etc/samba/dfs-update.conf`, creates per-NS dirs and per-NS sentinels. |
 | `dfs-update` | `SC_DFS_DRY_RUN=1` (optional) | One sync pass over every configured namespace. |
 | `dfs-schedule` | `SC_DFS_INTERVAL` (env) | Writes/enables the systemd timer + service. |
-| `dfs-status` | — | Drop-in present? Config? Timer state? Last log lines? Managed symlinks? |
+| `dfs-status` | — | Automatic root-proxy count/timer plus tertiary drop-in, config, timer, log, and symlink state. |
 | `dfs-remove` | — | Removes drop-in, units, config; leaves filesystem alone. |
 
 **TUI** (under main-menu item *DFS Namespace Server*) is at full
@@ -391,10 +403,18 @@ and runs a self-test against a captured WS2025 blob. No new
 packages — `python3-samba`, `ldb-tools`, and `flock` come with
 the existing `samba-ad-dc` install.
 
+The automatic proxy block is delimited in `/etc/samba/smb.conf` and is
+the only content that `dfs-root-sync` may replace. Discovery, parsing,
+validation, collision checking, and `testparm` validation complete before
+the file changes. Any failure retains the last known-good block. Targets
+marked offline and targets naming this DC are excluded; if that leaves no
+usable target, the sync fails visibly instead of creating a loop.
+
 ## 10. Test plan
 
-Scenario: `lab/scenarios/dfs-namespace.sh`. Validated end-to-end
-against the live lab; the steps below describe what currently runs.
+Scenario: `lab/scenarios/dfs-namespace.sh`. The existing tertiary path
+has been validated against the live lab; the automatic root-proxy assertions
+added here must pass in the release-candidate lab run.
 
 **pre_hook** (Windows-side setup via `Setup-DfsnTestNamespace.ps1`):
 
@@ -417,8 +437,10 @@ against the live lab; the steps below describe what currently runs.
 
 1. Bootstrap-install the parser helper from `/tmp/prepare-image.sh`
    if absent (handles golden images that predate DFS-N).
-2. `samba-sconfig join-dc` to get this DC into the forest.
-3. Wait for `msDFS-Linkv2` objects to appear in the local
+2. `samba-sconfig join-dc` to get this DC into the forest. The join must
+   create the `[Public]` root proxy before reporting success.
+3. Verify the automatic root proxy through `testparm`, then wait for
+   `msDFS-Linkv2` objects to appear in the local
    `sam.ldb` after replication.
 4. `samba-sconfig dfs-init`, `dfs-configure Public` (with prefer
    regex `^\\WIN-`), `dfs-update`.
@@ -430,6 +452,9 @@ against the live lab; the steps below describe what currently runs.
 
 **verify** (each check returns 0/1, all aggregated):
 
+- `[Public]` has a parsed `msdfs proxy` value.
+- From Windows, both `\\samba-dc1.lab.test\Public` and
+  `\\lab.test\Public` are accessible after flushing DFS caches.
 - Drop-in file present and `include = …` in `[global]`.
 - testparm parses `[dfs_root]` with `msdfs root = Yes`.
 - All four post-convergence symlinks present with the
@@ -468,7 +493,7 @@ regression tests.
 - **Site-aware referrals**: out of scope. If the operator needs
   this Samba DC to never win in-site against a Windows primary,
   AD site placement is the lever, not symlink ordering.
-- **End-to-end coverage of validator rejection of malformed AD
+- **End-to-end coverage of tertiary-link validator rejection of malformed AD
   links is shallower than ideal.** WS2025's schema enforces that
   every `msDFS-Linkv2` object carries
   `msDFS-NamespaceIdentityGUIDv2`, `msDFS-LinkIdentityGUIDv2`,
@@ -478,7 +503,10 @@ regression tests.
   validator ever sees it. The scenario's "no `evil*` on disk"
   check therefore passes trivially. The path-validator and
   UNC-validator logic is exercised against 22 adversarial inputs
-  by a local unit harness during development; promoting that to a
+  by a local unit harness during development. Automatic root parsing,
+  self-loop exclusion, stale removal, collision handling, legacy-v1 roots,
+  and last-known-good preservation are covered by
+  `tests/dfs-root-proxy.bats`. Promoting the malformed-link case to a
   proper end-to-end injection requires teaching the setup script
   to mint a fully-attributed bad link.
 
@@ -486,7 +514,8 @@ regression tests.
 
 - DFSR / content replication (Samba doesn't implement it).
 - Standalone (non-domain-based) namespaces.
-- v1 / "Windows 2000 server mode" namespaces.
+- v1 / "Windows 2000 server mode" folder-link materialization in optional
+  tertiary mode. Automatic root proxies do support v1 root targets.
 - Hosting the namespace metadata authoritatively from Samba (i.e.
   this Samba DC creating namespaces). The Windows DCs own the
   DFS-N configuration; this appliance is a passive replica.

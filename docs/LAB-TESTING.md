@@ -151,13 +151,18 @@ lab/run-scenario.sh join-dc --verify-only
 
 ### `dfs-namespace`
 
-Purpose: prove the Samba DC can serve as a tertiary domain-based DFS-N
-namespace target — read AD-replicated link metadata, validate it against
-adversarial input, materialize MSDFS symlinks, and refuse to prune in
-unsafe states. Background and design in [`DFS-N.md`](DFS-N.md).
+Purpose: prove both DFS-N responsibilities: a normal DC join automatically
+proxies existing domain namespace roots, and the separately configured
+tertiary mode can read replicated link metadata, validate adversarial input,
+materialize MSDFS symlinks, and refuse unsafe pruning. Background and design
+in [`DFS-N.md`](DFS-N.md).
 
 What it covers:
 
+- The join creates a managed root-proxy share for `\\lab.test\Public` before
+  tertiary setup begins, and enables its five-minute convergence timer.
+- A Windows client opens both `\\samba-dc1.lab.test\Public` and
+  `\\lab.test\Public` after flushing cached referrals.
 - `samba-sconfig dfs-init` writes a `conf.d` drop-in (read-only namespace
   share, msdfs root) and the global sentinel.
 - `samba-sconfig dfs-configure` records namespaces and the prefer-regex.
@@ -200,11 +205,11 @@ Lab-side prerequisites:
 - `Reset-DfsnTestNamespace.ps1` — idempotent teardown for re-runs.
 
 All three are staged automatically by the runner. The scenario does
-**not** register the Samba DC as a namespace root target — that
-requires the appliance to already be joined and serving the share,
-and `New-DfsnRootTarget` validates target reachability. Tertiary-
-priority registration is a deployment-time concern, not part of the
-test surface.
+**not** register the Samba DC as a namespace root target — the automatic
+root proxy must redirect to existing Windows namespace servers, not back
+to itself. Registering this DC is only needed for the optional tertiary
+mode, after its hosted namespace share exists. Tertiary-priority
+registration remains a deployment-time concern, not part of this test.
 
 ### `sysvol-sync-stale-then-pull`
 
@@ -402,6 +407,7 @@ place; reuse them):
   `provision-new` scenario)
 - `samba-sconfig join-dc` — additional-DC join (used by `join-dc`
   scenario)
+- `samba-sconfig dfs-root-sync` — automatic domain-root compatibility
 - `samba-sconfig dfs-init` / `dfs-configure` / `dfs-update` /
   `dfs-schedule` / `dfs-status` / `dfs-remove` — DFS-N command
   family (used by `dfs-namespace`)

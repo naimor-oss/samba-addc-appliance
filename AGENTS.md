@@ -135,10 +135,10 @@ bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 ## Important Samba Interop Notes
 
 - Samba does not implement DFSR. SYSVOL must be seeded or synced out of band.
-- DFS-N (domain-based) is implemented in `samba-sconfig dfs-*` for
-  tertiary-target deployments. AD-replicated `msDFS-Linkv2` objects are
-  materialized as MSDFS symlinks; see `docs/DFS-N.md` for the parsing
-  strategy, the adversarial-input rules, and the operator boundary.
+- Every provision/join automatically mirrors AD domain DFS roots into managed
+  `msdfs proxy` shares and keeps them converged. The separate optional
+  tertiary-target mode materializes AD-replicated `msDFS-Linkv2` objects as
+  MSDFS symlinks. See `docs/DFS-N.md` for both boundaries, parsing, and tests.
 - The join path probes target forest functional level because Samba's default
   can be too low for modern Windows forests.
 - The join path registers this DC's PTR record because Windows KCC can cache

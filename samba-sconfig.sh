@@ -20,11 +20,12 @@
 #===============================================================================
 set -uo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly SCRIPT_NAME="samba-sconfig"
 readonly WT_HEIGHT=22
 readonly WT_WIDTH=76
 readonly WT_MENU_HEIGHT=14
+readonly SAMBA_CONF="${SAMBA_SMB_CONF:-/etc/samba/smb.conf}"
 
 #===============================================================================
 # UTILITIES
@@ -865,6 +866,7 @@ apply_hardening_to_smb_conf() {
             print "\tclient signing = mandatory"
             print "\tserver min protocol = SMB3_00"
             print "\tclient min protocol = SMB3_00"
+            print "\thost msdfs = yes"
             print "\tldap server require strong auth = yes"
             print "\tkerberos encryption types = strong"
             print "\tntlm auth = mschapv2-and-ntlmv2-only"
@@ -1146,8 +1148,23 @@ Check the full log: $prov_log"
     fi
     rm -f "$prov_log" "${prov_log}.rc"
 
+    local dfs_out="" dfs_ok=1
+    if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+        dfs_ok=0
+    fi
+
     if is_addc_running; then
-        info "Domain provisioned!\n\nRealm: $DC_REALM | NetBIOS: $DC_NETBIOS\n\nNext: Run Diagnostics (6), Post-Domain Setup (3), Hardening (5)"
+        if (( dfs_ok )); then
+            info "Domain provisioned!\n\nRealm: $DC_REALM | NetBIOS: $DC_NETBIOS\n\nNext: Run Diagnostics (6), Post-Domain Setup (3), Hardening (5)"
+        else
+            info_text "Domain provisioned with DFS warning" "The domain was provisioned, but automatic DFS root referral setup failed.
+
+Domain namespace paths may fail when clients select this DC until this is corrected.
+
+${dfs_out}
+
+Retry: sudo samba-sconfig dfs-root-sync"
+        fi
     else
         info "WARNING: samba-ad-dc not running.\n\nCheck: journalctl -u samba-ad-dc -n 50"
     fi
@@ -1197,7 +1214,21 @@ domain_join_dc() {
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        info "Joined as additional DC (FL=$fl_str)!\nRealm: $DC_REALM"
+        local dfs_out="" dfs_ok=1
+        if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+            dfs_ok=0
+        fi
+        if (( dfs_ok )); then
+            info "Joined as additional DC (FL=$fl_str)!\nRealm: $DC_REALM"
+        else
+            info_text "Joined with DFS warning" "The DC join succeeded, but automatic DFS root referral setup failed.
+
+Domain namespace paths may fail when clients select this DC until this is corrected.
+
+${dfs_out}
+
+Retry: sudo samba-sconfig dfs-root-sync"
+        fi
     else
         info "Join FAILED.\n\nCheck connectivity to $existing_dc ($dc_ip) and credentials."
     fi
@@ -1244,7 +1275,21 @@ domain_join_rodc() {
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        info "Joined as RODC (FL=$fl_str)!\nRealm: $DC_REALM"
+        local dfs_out="" dfs_ok=1
+        if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+            dfs_ok=0
+        fi
+        if (( dfs_ok )); then
+            info "Joined as RODC (FL=$fl_str)!\nRealm: $DC_REALM"
+        else
+            info_text "RODC joined with DFS warning" "The RODC join succeeded, but automatic DFS root referral setup failed.
+
+Domain namespace paths may fail when clients select this DC until this is corrected.
+
+${dfs_out}
+
+Retry: sudo samba-sconfig dfs-root-sync"
+        fi
     else
         info "RODC join FAILED."
     fi
@@ -1584,6 +1629,366 @@ $(tail -12 /var/log/samba/sysvol-sync.log)
 #===============================================================================
 # 4b. DFS NAMESPACE
 #
+# Every AD DC can receive a domain DFS root-referral request. Windows DFS
+# stores each domain root and its namespace-server targets in replicated AD,
+# but Samba does not turn that metadata into share-level referrals by itself.
+# The root-proxy path below mirrors those roots into managed `msdfs proxy`
+# shares. It is automatic on provision/join and periodically converges.
+#
+# This is deliberately separate from the optional tertiary namespace-server
+# feature below. A root proxy redirects the whole share to existing namespace
+# servers; the tertiary mode hosts a local namespace tree of MSDFS symlinks.
+# Mixing their configuration would create self-referral loops.
+#
+# Design rationale and operator boundaries live in docs/DFS-N.md.
+#===============================================================================
+readonly DFS_ROOT_PROXY_BEGIN="# --- samba-sconfig managed domain DFS root proxies ---"
+readonly DFS_ROOT_PROXY_END="# --- end samba-sconfig managed domain DFS root proxies ---"
+readonly DFS_SAM_DB="${SAMBA_DFS_SAM_DB:-/var/lib/samba/private/sam.ldb}"
+readonly DFS_ROOT_PROXY_LOCK="${SAMBA_DFS_ROOT_PROXY_LOCK:-/run/samba-dfs-root-proxy-sync.lock}"
+readonly DFS_ROOT_PROXY_UNIT="${SAMBA_DFS_ROOT_PROXY_UNIT:-/etc/systemd/system/samba-dfs-root-proxy-sync.service}"
+readonly DFS_ROOT_PROXY_TIMER="${SAMBA_DFS_ROOT_PROXY_TIMER:-/etc/systemd/system/samba-dfs-root-proxy-sync.timer}"
+
+# Domain namespace names become smb.conf section names. Keep the accepted
+# character set aligned with ordinary Windows share names while excluding
+# section delimiters, path separators, controls, and embedded `$` markers.
+_dfs_root_name_validate() {
+    local base="${1%\$}"
+    [[ -n "$base" && "$base" != *\$* ]] || return 1
+    (( ${#base} >= 1 && ${#base} <= 80 )) || return 1
+    local pattern='^[A-Za-z0-9._&() -]+$'
+    [[ "$base" =~ $pattern ]] || return 1
+    [[ "$base" != " "* && "$base" != *" " ]] || return 1
+    [[ "$base" != "." && "$base" != ".." ]]
+}
+
+# Return true when a root target points back to this DC. A proxy containing
+# itself loops forever, so local short and FQDN target names are always
+# removed before rendering.
+_dfs_root_target_is_local() {
+    local unc="$1" rest server short fqdn
+    rest="${unc#\\\\}"
+    server="${rest%%\\*}"
+    server=$(printf '%s' "$server" | tr '[:upper:]' '[:lower:]')
+    server="${server%.}"
+    short=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fqdn=$(hostname -f 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fqdn="${fqdn%.}"
+    [[ -n "$server" && ( "$server" == "$short" || "$server" == "$fqdn" ) ]]
+}
+
+# Strip only the complete block owned by this feature. A missing or duplicate
+# marker is treated as corruption; never guess where operator content ends.
+_dfs_root_proxy_strip_managed_block() {
+    local input="$1" begin_count end_count begin_line end_line
+    begin_count=$(grep -Fc "$DFS_ROOT_PROXY_BEGIN" "$input" 2>/dev/null || true)
+    end_count=$(grep -Fc "$DFS_ROOT_PROXY_END" "$input" 2>/dev/null || true)
+    if (( begin_count > 1 || end_count > 1 || begin_count != end_count )); then
+        echo "[dfs-root] managed block markers are malformed in $input; refusing to rewrite" >&2
+        return 1
+    fi
+    if (( begin_count == 1 )); then
+        begin_line=$(grep -Fn "$DFS_ROOT_PROXY_BEGIN" "$input" | cut -d: -f1)
+        end_line=$(grep -Fn "$DFS_ROOT_PROXY_END" "$input" | cut -d: -f1)
+        if (( begin_line >= end_line )); then
+            echo "[dfs-root] managed block markers are reversed in $input; refusing to rewrite" >&2
+            return 1
+        fi
+    fi
+
+    # Buffer blank lines and discard only trailing ones. This keeps repeated
+    # syncs byte-stable instead of adding a blank line on every timer pass.
+    awk -v begin="$DFS_ROOT_PROXY_BEGIN" -v end="$DFS_ROOT_PROXY_END" '
+        $0 == begin { skip=1; next }
+        $0 == end   { skip=0; next }
+        skip        { next }
+        $0 == ""    { blanks=blanks ORS; next }
+        {
+            if (blanks != "") printf "%s", blanks
+            blanks=""
+            print
+        }
+    ' "$input"
+}
+
+# Convert parsed target records to "name<TAB>proxy-list". The update is
+# all-or-nothing: malformed online targets reject the entire sync, while
+# offline targets and this DC's own target are intentionally omitted.
+_dfs_root_proxy_render_parsed() {
+    local name="$1" parsed="$2"
+    _dfs_root_name_validate "$name" || {
+        echo "[dfs-root] invalid namespace name: $name" >&2
+        return 1
+    }
+
+    local priority rank state unc state_lc
+    local online=""
+    while IFS=$'\t' read -r priority rank state unc; do
+        [[ -n "$unc" ]] || continue
+        state_lc=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
+        [[ "$state_lc" == "online" ]] || continue
+        _dfs_validate_target_unc "$unc" || {
+            echo "[dfs-root/$name] invalid target: $unc" >&2
+            return 1
+        }
+        _dfs_root_target_is_local "$unc" && continue
+        online+="${priority}"$'\t'"${rank}"$'\t'"${state}"$'\t'"${unc}"$'\n'
+    done <<< "$parsed"
+
+    [[ -n "$online" ]] || {
+        echo "[dfs-root/$name] no non-local online targets; refusing a self-referral" >&2
+        return 1
+    }
+
+    local ordered target proxy=""
+    ordered=$(printf '%s' "$online" | _dfs_order_targets "") || return 1
+    while IFS= read -r target; do
+        [[ -n "$target" ]] || continue
+        # Samba's smb.conf syntax uses one leading backslash here, whereas
+        # the AD XML stores a conventional UNC with two.
+        target="${target#\\}"
+        proxy+="${proxy:+,}${target}"
+    done <<< "$ordered"
+    [[ -n "$proxy" ]] || return 1
+    printf '%s\t%s\n' "$name" "$proxy"
+}
+
+_dfs_root_proxy_render_record() {
+    local name="$1" blob="$2" parsed
+    [[ -n "$blob" ]] || {
+        echo "[dfs-root/$name] missing msDFS-TargetListv2" >&2
+        return 1
+    }
+    parsed=$(_dfs_render_targets "$blob") || {
+        echo "[dfs-root/$name] target-list parse failed" >&2
+        return 1
+    }
+    _dfs_root_proxy_render_parsed "$name" "$parsed"
+}
+
+# Domain-v1 roots predate msDFS-TargetListv2. Their multivalued
+# remoteServerName attribute is already a list of root-target UNCs, followed
+# by a literal `*` terminator. Give each usable target neutral priority and
+# pass it through the same validation/self-loop filter as v2 metadata.
+_dfs_root_proxy_render_v1_record() {
+    local name="$1" remotes="$2" unc parsed=""
+    while IFS= read -r unc; do
+        [[ -n "$unc" ]] || continue
+        [[ "$unc" == "*" ]] && continue
+        parsed+=$'siteCostNormal\t0\tonline\t'"${unc}"$'\n'
+    done <<< "$remotes"
+    [[ -n "$parsed" ]] || {
+        echo "[dfs-root/$name] domain-v1 root has no remoteServerName targets" >&2
+        return 1
+    }
+    _dfs_root_proxy_render_parsed "$name" "$parsed"
+}
+
+# Discover every replicated v2 domain namespace and atomically converge the
+# managed smb.conf block. Failed discovery, parsing, validation, collision, or
+# testparm validation leaves the last known-good file untouched.
+_dfs_sync_domain_root_proxies() (
+    [[ -f "$SAMBA_CONF" ]] || {
+        echo "[dfs-root] $SAMBA_CONF is absent; provision or join the domain first" >&2
+        return 1
+    }
+
+    exec 8>"$DFS_ROOT_PROXY_LOCK" || {
+        echo "[dfs-root] cannot open lock $DFS_ROOT_PROXY_LOCK" >&2
+        return 1
+    }
+    if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
+        echo "[dfs-root] another sync is in progress; exiting" >&2
+        return 0
+    fi
+
+    local base_dn search_base raw unwrapped
+    base_dn=$(_dfs_get_base_dn) || {
+        echo "[dfs-root] could not derive the domain base DN" >&2
+        return 1
+    }
+    # Search from CN=System so a new forest with no Dfs-Configuration
+    # container returns zero records instead of a missing-base error.
+    search_base="CN=System,${base_dn}"
+    raw=$(ldbsearch -H "$DFS_SAM_DB" -b "$search_base" -s sub \
+            '(|(objectClass=msDFS-Namespacev2)(objectClass=fTDfs))' \
+            objectClass name cn msDFS-TargetListv2 remoteServerName 2>&1) || {
+        echo "[dfs-root] namespace discovery failed:" >&2
+        printf '%s\n' "$raw" | head -3 >&2
+        return 1
+    }
+    unwrapped=$(printf '%s\n' "$raw" | _dfs_unwrap_ldif)
+
+    local records candidate installed existing
+    records=$(mktemp) || return 1
+    candidate=$(mktemp "${SAMBA_CONF}.dfs-root-proxy.XXXXXX") || {
+        rm -f "$records"
+        return 1
+    }
+    installed="${candidate}.installed"
+
+    local cur_class="" cur_name="" cur_blob="" cur_remotes="" record_failed=0
+    _dfs_root_flush_record() {
+        if [[ -n "$cur_name" || -n "$cur_blob" || -n "$cur_remotes" ]]; then
+            if [[ "$cur_class" == "fTDfs" ]]; then
+                _dfs_root_proxy_render_v1_record "$cur_name" "$cur_remotes" >> "$records" \
+                    || record_failed=1
+            else
+                _dfs_root_proxy_render_record "$cur_name" "$cur_blob" >> "$records" \
+                    || record_failed=1
+            fi
+        fi
+        cur_class=""; cur_name=""; cur_blob=""; cur_remotes=""
+    }
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            'dn: '*)                    _dfs_root_flush_record ;;
+            '')                         _dfs_root_flush_record ;;
+            'objectClass: fTDfs')       cur_class="fTDfs" ;;
+            'name: '*)                  cur_name="${line#name: }" ;;
+            'cn: '*)                    cur_name="${line#cn: }" ;;
+            'msDFS-TargetListv2:: '*)   cur_blob="${line#msDFS-TargetListv2:: }" ;;
+            'remoteServerName: '*)      cur_remotes+="${line#remoteServerName: }"$'\n' ;;
+        esac
+    done <<< "$unwrapped"
+    _dfs_root_flush_record
+    if (( record_failed )); then
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if [[ ! -s "$records" ]] && ! grep -Fq "$DFS_ROOT_PROXY_BEGIN" "$SAMBA_CONF"; then
+        rm -f "$records" "$candidate" "$installed"
+        echo "[dfs-root] no domain namespaces detected"
+        return 0
+    fi
+
+    if ! _dfs_root_proxy_strip_managed_block "$SAMBA_CONF" > "$candidate"; then
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    # Any case-insensitive collision outside our old managed block belongs to
+    # Samba or the operator. Refuse to shadow it with an AD-derived share.
+    existing=$(awk '/^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/ {
+        name=$0
+        sub(/^[[:space:]]*\[/,"",name)
+        sub(/\][[:space:]]*(#.*)?$/,"",name)
+        print tolower(name)
+    }' "$candidate")
+    local name proxy name_lc duplicate="" collision=""
+    while IFS=$'\t' read -r name proxy; do
+        [[ -n "$name" ]] || continue
+        name_lc=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+        if grep -Fxq -- "$name_lc" <<< "$existing"; then
+            collision="existing share [$name] conflicts with the domain namespace"
+            break
+        fi
+        if grep -Fxiq -- "$name" <<< "$duplicate"; then
+            collision="duplicate namespace name in AD: $name"
+            break
+        fi
+        duplicate+="${name}"$'\n'
+    done < "$records"
+    if [[ -n "$collision" ]]; then
+        echo "[dfs-root] ${collision}; refusing to overwrite the configuration" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if [[ -s "$records" ]]; then
+        {
+            printf '\n%s\n' "$DFS_ROOT_PROXY_BEGIN"
+            printf '# Generated from replicated AD namespace-root metadata.\n'
+            while IFS=$'\t' read -r name proxy; do
+                [[ -n "$name" ]] || continue
+                printf '[%s]\n' "$name"
+                printf '    msdfs root = yes\n'
+                printf '    msdfs proxy = %s\n\n' "$proxy"
+            done < <(LC_ALL=C sort -f -t $'\t' -k1,1 "$records")
+            printf '%s\n' "$DFS_ROOT_PROXY_END"
+        } >> "$candidate"
+    fi
+
+    if cmp -s "$candidate" "$SAMBA_CONF"; then
+        rm -f "$records" "$candidate" "$installed"
+        echo "[dfs-root] domain namespace proxies already current"
+        return 0
+    fi
+    if ! testparm -s "$candidate" >/dev/null 2>&1; then
+        echo "[dfs-root] generated Samba configuration failed testparm; keeping the prior file" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if ! cp -p "$SAMBA_CONF" "$installed" \
+            || ! cat "$candidate" > "$installed" \
+            || ! mv "$installed" "$SAMBA_CONF"; then
+        echo "[dfs-root] failed to install generated Samba configuration" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+    rm -f "$records" "$candidate"
+    if ! smbcontrol all reload-config >/dev/null 2>&1; then
+        echo "[dfs-root] configuration installed, but Samba reload failed" >&2
+        return 1
+    fi
+    echo "[dfs-root] domain namespace proxies updated"
+)
+
+_dfs_install_root_proxy_timer() {
+    install -d -m 0755 "$(dirname "$DFS_ROOT_PROXY_UNIT")"
+    cat > "$DFS_ROOT_PROXY_UNIT" <<'UNITEOF'
+[Unit]
+Description=Samba domain DFS root proxy sync
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/samba-sconfig dfs-root-sync
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/etc/samba /run
+ReadOnlyPaths=/var/lib/samba
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UNITEOF
+    cat > "$DFS_ROOT_PROXY_TIMER" <<'TIMEREOF'
+[Unit]
+Description=Periodic Samba domain DFS root proxy sync
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=1min
+Persistent=true
+Unit=samba-dfs-root-proxy-sync.service
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+    systemctl daemon-reload
+    systemctl enable --now samba-dfs-root-proxy-sync.timer
+}
+
+configure_domain_dfs_root_proxies() {
+    local rc=0
+    _dfs_sync_domain_root_proxies || rc=1
+    _dfs_install_root_proxy_timer || {
+        echo "[dfs-root] failed to install periodic convergence timer" >&2
+        rc=1
+    }
+    return "$rc"
+}
+
+#===============================================================================
+# 4c. DFS TERTIARY NAMESPACE SERVER
+#
 # Tertiary domain-based DFS-N namespace server. The Windows-side admin
 # adds this DC as a low-priority namespace root target; this code reads
 # the (replicated) AD link metadata and materializes it as MSDFS symlinks
@@ -1610,8 +2015,14 @@ readonly DFS_LOG="/var/log/samba/dfs-update.log"
 # Lower-cased on output. Returns 1 if smb.conf has no realm.
 _dfs_get_base_dn() {
     local realm
-    realm=$(grep -oP '^[[:space:]]*realm[[:space:]]*=[[:space:]]*\K.*' \
-                /etc/samba/smb.conf 2>/dev/null | head -1 | tr A-Z a-z | tr -d '[:space:]\r')
+    realm=$(awk -F= '
+        tolower($1) ~ /^[[:space:]]*realm[[:space:]]*$/ {
+            value=substr($0, index($0, "=") + 1)
+            gsub(/[[:space:]\r]/, "", value)
+            print tolower(value)
+            exit
+        }
+    ' "$SAMBA_CONF" 2>/dev/null)
     [[ -z "$realm" ]] && return 1
     local IFS=. parts=()
     read -r -a parts <<< "$realm"
@@ -1668,7 +2079,13 @@ _dfs_normalize_link_path() {
 _dfs_validate_target_unc() {
     local unc="$1"
     if command -v appcore_id_unc_validate >/dev/null 2>&1; then
-        appcore_id_unc_validate "$unc"
+        appcore_id_unc_validate "$unc" || return 1
+        # DFS referral targets here must stop at server\share. The shared UNC
+        # primitive also accepts subpaths for other consumers, so enforce this
+        # narrower contract after its structural validation.
+        local appcore_rest="${unc#\\\\}"
+        local appcore_after="${appcore_rest#*\\}"
+        [[ "$appcore_after" != *\\* ]]
         return
     fi
     # Fallback (kept terse): reject anything that could corrupt the
@@ -1709,7 +2126,7 @@ _dfs_render_targets() {
 
 # Order targets first by AD-sourced priorityClass (DFS-N convention:
 # globalHigh, siteCostHigh, siteCostNormal, siteCostLow, globalLow), then
-# move SC_DFS_PREFER-regex matches to the front of each priority bucket.
+# move SC_DFS_PREFER-regex matches to the front of equal class/rank targets.
 # Operator-supplied prefer thus refines AD priority; it can't override it
 # (which would defeat the point of the Windows-side priority configuration).
 #
@@ -1723,9 +2140,9 @@ _dfs_order_targets() {
         [[ -z "$rec" ]] && continue
         recs+=("$rec")
     done
-    # AWK does the multi-key sort: numeric class rank, then prefer match,
-    # then preserve original order via line number. Bash 3.2 doesn't have
-    # multi-key sort; awk is everywhere and keeps the logic readable.
+    # AWK does the multi-key sort: class, AD priority rank, prefer match,
+    # then original order. AD priority remains authoritative; the optional
+    # regex only breaks ties within the same class and rank.
     printf '%s\n' "${recs[@]}" | awk -F'\t' -v prefer="$prefer" '
         BEGIN {
             cls["globalHigh"]=0; cls["siteCostHigh"]=1; cls["siteCostNormal"]=2;
@@ -1733,10 +2150,11 @@ _dfs_order_targets() {
         }
         {
             c = (($1 in cls) ? cls[$1] : 9)
+            r = ($2 ~ /^[0-9]+$/ ? $2 : 0)
             p = (prefer != "" && $4 ~ prefer) ? 0 : 1
-            printf "%d\t%d\t%06d\t%s\n", c, p, NR, $4
+            printf "%d\t%09d\t%d\t%06d\t%s\n", c, r, p, NR, $4
         }
-    ' | sort -t $'\t' -k1,1n -k2,2n -k3,3n | awk -F'\t' '{print $4}'
+    ' | sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n | awk -F'\t' '{print $5}'
 }
 
 # Atomic-swap a msdfs symlink. Caller passes the full literal symlink target
@@ -2100,8 +2518,8 @@ _dfs_apply_one_link() {
         }
     done <<< "$tsv_records"
 
-    # Order by AD priority class first, then by prefer regex within each
-    # bucket. Output is one UNC per line.
+    # Order by AD priority class/rank first, then by prefer regex among ties.
+    # Output is one UNC per line.
     local ordered
     ordered=$(printf '%s\n' "$tsv_records" | _dfs_order_targets "${DFS_PREFER:-}")
 
@@ -2233,7 +2651,7 @@ tui_dfs_configure() {
         "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-80 chars, letters/digits/dot/underscore/dash.\nA trailing \$ marks the namespace as hidden in network browsing\n(e.g. Engineering\$, Public\$)." \
         14 76 "${DFS_NAMESPACES:-}" 3>&1 1>&2 2>&3) || return
     prefer=$(whiptail --inputbox \
-        "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of each priority bucket. Leave blank to use AD priorityClass only.\nExample: ^\\\\\\\\WIN-" \
+        "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of equal-priority targets. Leave blank to use AD priority only.\nExample: ^\\\\\\\\WIN-" \
         13 72 "${DFS_PREFER:-}" 3>&1 1>&2 2>&3) || return
     # Delegate to the CLI subcommand so name validation is shared.
     local out
@@ -2789,7 +3207,13 @@ cli_join_dc() {
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        echo "[sconfig] JOIN SUCCESS (FL=$fl_str) — TLS cert has SAN, PTR registered, SYSVOL seeded"
+        if configure_domain_dfs_root_proxies; then
+            echo "[sconfig] JOIN SUCCESS (FL=$fl_str) — TLS cert has SAN, PTR registered, SYSVOL seeded, DFS roots synchronized"
+        else
+            echo "[sconfig] JOINED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
+            echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
+            return 2
+        fi
     else
         local rc=$?
         echo "[sconfig] JOIN FAILED (rc=$rc)" >&2
@@ -2821,7 +3245,13 @@ cli_provision_new() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         _generate_tls_cert_core
-        echo "[sconfig] PROVISION SUCCESS (realm=$DC_REALM, netbios=$DC_NETBIOS)"
+        if configure_domain_dfs_root_proxies; then
+            echo "[sconfig] PROVISION SUCCESS (realm=$DC_REALM, netbios=$DC_NETBIOS)"
+        else
+            echo "[sconfig] PROVISIONED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
+            echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
+            return 2
+        fi
     else
         local rc=$?
         echo "[sconfig] PROVISION FAILED (rc=$rc)" >&2
@@ -2916,6 +3346,10 @@ cli_dfs_update() {
     _dfs_run_update
 }
 
+cli_dfs_root_sync() {
+    _dfs_sync_domain_root_proxies
+}
+
 cli_dfs_schedule_inner() {
     local interval="$1"
     [[ -n "$interval" ]] || { echo "[dfs-schedule] interval required" >&2; return 1; }
@@ -2930,6 +3364,17 @@ cli_dfs_schedule() {
 }
 
 cli_dfs_status() {
+    local root_proxy_count root_timer
+    root_proxy_count=$(awk -v begin="$DFS_ROOT_PROXY_BEGIN" -v end="$DFS_ROOT_PROXY_END" '
+        $0 == begin { managed=1; next }
+        $0 == end   { managed=0; next }
+        managed && /^\[[^]]+\]$/ { count++ }
+        END { print count+0 }
+    ' "$SAMBA_CONF" 2>/dev/null)
+    root_timer=$(systemctl is-active samba-dfs-root-proxy-sync.timer 2>/dev/null)
+    echo "Root proxies: ${root_proxy_count:-0}"
+    echo "Root timer:   ${root_timer:-unknown}"
+    echo
     echo "Drop-in:    ${DFS_INCLUDE_FILE} $([[ -f $DFS_INCLUDE_FILE ]] && echo present || echo absent)"
     echo "Config:     ${DFS_CONF} $([[ -f $DFS_CONF ]] && echo present || echo absent)"
     if [[ -f "$DFS_CONF" ]]; then
@@ -3010,7 +3455,11 @@ Usage: samba-sconfig                       # interactive TUI
            required env: SC_REALM, SC_NETBIOS, SC_PASS
            optional env: SC_FWD (default: 1.1.1.1)
 
-DFS-N (domain-based namespace tertiary target):
+DFS-N (automatic domain-root compatibility):
+       samba-sconfig dfs-root-sync        # sync existing domain root proxies
+                                           # (also runs automatically every 5 min)
+
+DFS-N (optional tertiary namespace target):
        samba-sconfig dfs-init              # install drop-in share + sentinel
            optional env: SC_DFS_ROOT (default: ${DFS_DEFAULT_ROOT})
                          SC_DFS_SHARE (default: ${DFS_DEFAULT_SHARE})
@@ -3041,6 +3490,7 @@ case "${1:-}" in
     probe-fl)       shift; cli_probe_fl "$@" ;;
     join-dc)        cli_join_dc ;;
     provision-new)  cli_provision_new ;;
+    dfs-root-sync)  cli_dfs_root_sync ;;
     dfs-init)       cli_dfs_init ;;
     dfs-configure)  shift; cli_dfs_configure "$@" ;;
     dfs-update)     cli_dfs_update ;;
