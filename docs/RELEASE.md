@@ -391,6 +391,20 @@ The TUI walks you through:
 3. **Security Hardening** → applies signing/min-protocol/etc. settings
    to `smb.conf`.
 
+An existing forest can have thousands of SYSVOL entries. The join's final ACL
+reset therefore runs as `samba-sysvol-acl-reset.service`, not as a child of the
+SSH session. The TUI prints elapsed heartbeats while it waits. If the connection
+drops, the reset continues; reconnect and inspect it with:
+
+```bash
+sudo samba-sconfig sysvol-acl-status
+```
+
+Full output and the completion duration are retained in
+`/var/log/samba/sysvol-acl-reset.log`. Retry a failed reset with
+`sudo samba-sconfig sysvol-acl-reset`; the join reports a partial failure until
+that succeeds.
+
 For unattended deployments, the headless CLI subcommands are:
 
 ```bash

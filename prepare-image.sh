@@ -455,6 +455,11 @@ for src in /root/samba-sconfig.sh /root/samba-sconfig; do
 done
 [[ -x /usr/local/sbin/samba-sconfig ]] || warn "samba-sconfig not found — copy it manually to /usr/local/sbin/"
 
+if [[ -x /usr/local/sbin/samba-sconfig ]]; then
+    log "Installing durable SYSVOL NTACL reset service..."
+    /usr/local/sbin/samba-sconfig sysvol-acl-install
+fi
+
 grep -q 'samba-sconfig' /root/.bashrc 2>/dev/null || \
     echo 'alias sconfig="sudo samba-sconfig"' >> /root/.bashrc
 
@@ -646,8 +651,8 @@ cat > /usr/local/sbin/sysvol-sync << 'SYNCEOF'
 #      (settled, no DFSR mid-flight). The first peer that answers yes is
 #      used as the source.
 #   5. The chosen GPO is pulled into a staging tmpdir and rsync'd into place
-#      atomically per-GPO, then `samba-tool ntacl sysvolreset` is run once at
-#      the end if any GPO actually changed.
+#      atomically per-GPO, then the durable SYSVOL NTACL reset service runs
+#      once at the end if any GPO actually changed.
 #
 # Authentication uses smbclient -P (Privileged), which makes Samba's own
 # tooling pick up this DC's machine credentials directly from
@@ -697,6 +702,10 @@ EXCLUDE_DCS="${EXCLUDE_DCS:-}"
 if [[ "$MODE" == "sync" ]]; then
     exec 200>"$LOCKFILE"
     flock -n 200 || { say "skip: another sysvol-sync is already running"; exit 0; }
+    if systemctl is-active --quiet samba-sysvol-acl-reset.service; then
+        say "skip: SYSVOL NTACL reset is already running"
+        exit 0
+    fi
 fi
 
 # --- environment from smb.conf -------------------------------------------------
@@ -1009,12 +1018,22 @@ for guid in "${!target_versions[@]}"; do
     rm -rf "$stage"
 done
 
-# A single whole-tree sysvolreset at the end is cheaper than per-GPO walks
-# and matches what samba-tool exposes (no per-path scope).
+# A single whole-tree reset at the end is cheaper than per-GPO walks and
+# matches what samba-tool exposes (no per-path scope). The systemd unit also
+# serializes resets and lets one finish if the cron client is interrupted.
 if [[ $any_pulled -eq 1 ]]; then
-    say "running ntacl sysvolreset"
-    samba-tool ntacl sysvolreset >>"$LOGFILE" 2>&1 \
-        || say "WARN: ntacl sysvolreset failed"
+    say "starting durable SYSVOL NTACL reset"
+    # The reset service takes this same lock. Release it before waiting for
+    # systemd, otherwise the puller would wait on a service that is waiting on
+    # the puller. A manual reset started during this sync waits here instead of
+    # rewriting ACLs while files are still being replaced.
+    flock -u 200
+    if systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1; then
+        say "SYSVOL NTACL reset completed"
+    else
+        say "ERROR: SYSVOL NTACL reset failed; see /var/log/samba/sysvol-acl-reset.log"
+        exit 1
+    fi
 fi
 
 say "done: new=$new_count updated=$update_count deleted=$delete_count current=$skip_count no-source=$no_source_count"

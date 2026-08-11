@@ -19,6 +19,10 @@ verify() {
     say "samba-sconfig is installed"
     ssh_vm 'test -x /usr/local/sbin/samba-sconfig && sudo /usr/local/sbin/samba-sconfig --help | head -20' || rc=1
 
+    say "durable SYSVOL NTACL reset service is installed"
+    ssh_vm 'sudo systemctl cat samba-sysvol-acl-reset.service --no-pager |
+            grep -Fq "ExecStart=/usr/bin/flock --exclusive /run/sysvol-sync.lock /usr/local/sbin/samba-sconfig sysvol-acl-worker"' || rc=1
+
     say "required appliance tools are present"
     # Outer single quotes preserve the literal $c through ssh; the \$c
     # below survives the remote shell's parsing of the double-quoted

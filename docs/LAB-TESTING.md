@@ -133,6 +133,9 @@ What it covers today:
 - Windows-side DNS/PTR behavior.
 - Forced KCC after PTR creation.
 - Initial SYSVOL seed from `//WS2025-DC1/sysvol`.
+- The service-owned SYSVOL NTACL reset reaches `inactive/dead`, reports
+  `Result=success`, and records a completion duration in
+  `/var/log/samba/sysvol-acl-reset.log`.
 - Samba-side DRS health.
 - Windows-side replication verification.
 - TLS certificate SAN presence.
@@ -288,8 +291,10 @@ Assertions:
   world-readable files.
 - `sysvol-sync` pulls from `//WS2025-DC1/sysvol`.
 - Deleted and changed files converge locally.
-- `samba-tool ntacl sysvolreset` completes.
-- Logs are written to `/var/log/samba/sysvol-sync.log`.
+- `samba-sysvol-acl-reset.service` completes and serializes the whole-tree
+  reset rather than tying it to the cron or SSH client process.
+- Sync logs are written to `/var/log/samba/sysvol-sync.log`; reset output and
+  duration are written to `/var/log/samba/sysvol-acl-reset.log`.
 - The scheduled cron entry or future systemd timer exists and runs.
 
 Why it matters: Samba has no DFSR, so this is not optional operational glue.
@@ -407,6 +412,8 @@ place; reuse them):
   `provision-new` scenario)
 - `samba-sconfig join-dc` — additional-DC join (used by `join-dc`
   scenario)
+- `samba-sconfig sysvol-acl-reset` / `sysvol-acl-status` — start the durable
+  ACL reset or inspect it from a replacement SSH session
 - `samba-sconfig dfs-root-sync` — automatic domain-root compatibility
 - `samba-sconfig dfs-init` / `dfs-configure` / `dfs-update` /
   `dfs-schedule` / `dfs-status` / `dfs-remove` — DFS-N command

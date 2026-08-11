@@ -20,7 +20,7 @@
 #===============================================================================
 set -uo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.2.1"
 readonly SCRIPT_NAME="samba-sconfig"
 readonly WT_HEIGHT=22
 readonly WT_WIDTH=76
@@ -989,8 +989,14 @@ seed_sysvol() {
             >/dev/null 2>&1; then
         if [[ -d "${tmpdir}/${realm_lower}" ]]; then
             cp -a "${tmpdir}/${realm_lower}/." "/var/lib/samba/sysvol/${realm_lower}/"
-            echo "[sconfig] SYSVOL seeded. Resetting NTACLs..."
-            samba-tool ntacl sysvolreset 2>&1 | sed 's/^/[ntacl] /' || true
+            echo "[sconfig] SYSVOL seeded. Starting durable NTACL reset..."
+            if ! run_sysvol_acl_reset; then
+                echo "[sconfig] ERROR: SYSVOL was copied, but its NTACL reset failed." >&2
+                echo "[sconfig]        Status: sudo samba-sconfig sysvol-acl-status" >&2
+                echo "[sconfig]        Retry:  sudo samba-sconfig sysvol-acl-reset" >&2
+                rm -rf "$tmpdir"
+                return 2
+            fi
             rm -rf "$tmpdir"
             return 0
         fi
@@ -999,6 +1005,60 @@ seed_sysvol() {
     echo "[sconfig]       until sysvol-sync runs. Verify SMB signing + creds on $src_dc."
     rm -rf "$tmpdir"
     return 1
+}
+
+_tui_report_join_outcome() {
+    local role="$1" fl="$2" realm="$3" sysvol_rc="$4" dfs_rc="$5" dfs_out="$6"
+    if (( sysvol_rc == 0 && dfs_rc == 0 )); then
+        info "Joined as ${role} (FL=$fl)!\nRealm: $realm"
+        return 0
+    fi
+
+    local body="The domain join succeeded, but post-join setup needs attention."
+    case "$sysvol_rc" in
+        1)
+            body+=$'\n\nSYSVOL seed failed. This DC may have missing Group Policy files.'
+            body+=$'\nCheck source-DC connectivity and credentials, then retry the join workflow before release.'
+            ;;
+        2)
+            body+=$'\n\nSYSVOL was copied, but its NTACL reset failed.'
+            body+=$'\nStatus: sudo samba-sconfig sysvol-acl-status'
+            body+=$'\nRetry:  sudo samba-sconfig sysvol-acl-reset'
+            body+=$'\nLog:    '"$SYSVOL_ACL_RESET_LOG"
+            ;;
+    esac
+    if (( dfs_rc != 0 )); then
+        body+=$'\n\nAutomatic DFS root referral setup failed. Domain namespace paths may fail when clients select this DC.'
+        body+=$'\n\n'"$dfs_out"
+        body+=$'\n\nRetry: sudo samba-sconfig dfs-root-sync'
+    fi
+    info_text "Joined with post-join warning" "$body"
+    return 1
+}
+
+_cli_report_join_outcome() {
+    local fl="$1" sysvol_rc="$2" dfs_rc="$3"
+    local failed=0
+    case "$sysvol_rc" in
+        1)
+            echo "[sconfig] JOINED, BUT SYSVOL SEED FAILED — Group Policy files may be missing" >&2
+            failed=1
+            ;;
+        2)
+            echo "[sconfig] JOINED, BUT SYSVOL ACL RESET FAILED" >&2
+            echo "[sconfig] Status: sudo samba-sconfig sysvol-acl-status" >&2
+            echo "[sconfig] Retry:  sudo samba-sconfig sysvol-acl-reset" >&2
+            failed=1
+            ;;
+    esac
+    if (( dfs_rc != 0 )); then
+        echo "[sconfig] JOINED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
+        echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
+        failed=1
+    fi
+    (( failed == 0 )) || return 2
+
+    echo "[sconfig] JOIN SUCCESS (FL=$fl) — TLS cert has SAN, PTR registered, SYSVOL seeded and ACLs reset, DFS roots synchronized"
 }
 
 # Re-point chrony at a domain time source. Called post-join / post-provision.
@@ -1211,24 +1271,18 @@ domain_join_dc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        local dfs_out="" dfs_ok=1
+        local dfs_out="" dfs_rc=0
         if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
-            dfs_ok=0
+            dfs_rc=1
         fi
-        if (( dfs_ok )); then
-            info "Joined as additional DC (FL=$fl_str)!\nRealm: $DC_REALM"
-        else
-            info_text "Joined with DFS warning" "The DC join succeeded, but automatic DFS root referral setup failed.
-
-Domain namespace paths may fail when clients select this DC until this is corrected.
-
-${dfs_out}
-
-Retry: sudo samba-sconfig dfs-root-sync"
-        fi
+        # Keep the service-owned, potentially long ACL reset last. If the SSH
+        # client disappears while monitoring it, every other post-join step is
+        # already complete and systemd finishes the reset independently.
+        local sysvol_rc=0
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _tui_report_join_outcome "additional DC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "Join FAILED.\n\nCheck connectivity to $existing_dc ($dc_ip) and credentials."
     fi
@@ -1272,24 +1326,15 @@ domain_join_rodc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        local dfs_out="" dfs_ok=1
+        local dfs_out="" dfs_rc=0
         if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
-            dfs_ok=0
+            dfs_rc=1
         fi
-        if (( dfs_ok )); then
-            info "Joined as RODC (FL=$fl_str)!\nRealm: $DC_REALM"
-        else
-            info_text "RODC joined with DFS warning" "The RODC join succeeded, but automatic DFS root referral setup failed.
-
-Domain namespace paths may fail when clients select this DC until this is corrected.
-
-${dfs_out}
-
-Retry: sudo samba-sconfig dfs-root-sync"
-        fi
+        local sysvol_rc=0
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _tui_report_join_outcome "RODC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "RODC join FAILED."
     fi
@@ -1471,6 +1516,11 @@ reset_admin_password() {
 SYSVOL_SYNC_CONF="/etc/samba/sysvol-sync.conf"
 SYSVOL_SYNC_CRON="/etc/cron.d/sysvol-sync"
 SYSVOL_SYNC_OLD_CRED="/etc/samba/sysvol-sync.cred"
+readonly SYSVOL_ACL_RESET_SERVICE="${SAMBA_SYSVOL_ACL_RESET_SERVICE:-samba-sysvol-acl-reset.service}"
+readonly SYSVOL_ACL_RESET_UNIT_FILE="${SAMBA_SYSVOL_ACL_RESET_UNIT_FILE:-/etc/systemd/system/${SYSVOL_ACL_RESET_SERVICE}}"
+readonly SYSVOL_ACL_RESET_LOG="${SAMBA_SYSVOL_ACL_RESET_LOG:-/var/log/samba/sysvol-acl-reset.log}"
+readonly SYSVOL_ACL_RESET_HEARTBEAT="${SAMBA_SYSVOL_ACL_RESET_HEARTBEAT:-15}"
+readonly SYSVOL_ACL_RESET_POLL="${SAMBA_SYSVOL_ACL_RESET_POLL:-1}"
 
 menu_sysvol_sync() {
     is_provisioned || { info "Not provisioned."; return; }
@@ -1485,6 +1535,7 @@ menu_sysvol_sync() {
             "3" "Show SYSVOL Freshness (per-GPO version table)" \
             "4" "Show Sync Status" \
             "5" "Reset SYSVOL ACLs" \
+            "6" "Show SYSVOL ACL Reset Status" \
             "B" "Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -1494,6 +1545,7 @@ menu_sysvol_sync() {
             3) show_sysvol_freshness ;;
             4) show_sync_status ;;
             5) reset_sysvol_acls ;;
+            6) show_sysvol_acl_reset_status ;;
             B|b) return ;;
         esac
     done
@@ -1561,8 +1613,20 @@ run_sysvol_sync() {
     [[ -f "$SYSVOL_SYNC_CONF" ]] || { info "Not configured. Run Configure (menu 1) first."; return; }
     yesno "Run SYSVOL sync now?" || return
     whiptail --infobox "Syncing..." 6 40
-    local output; output=$(/usr/local/sbin/sysvol-sync 2>&1)
-    info "Run complete. Log: /var/log/samba/sysvol-sync.log\n\n$(echo "$output" | tail -8)"
+    local output rc
+    output=$(/usr/local/sbin/sysvol-sync 2>&1)
+    rc=$?
+    if (( rc == 0 )); then
+        info "Run complete. Log: /var/log/samba/sysvol-sync.log\n\n$(echo "$output" | tail -8)"
+    else
+        info_text "SYSVOL sync failed" "The sync or its NTACL reset failed (rc=$rc).
+
+Sync log:  /var/log/samba/sysvol-sync.log
+NTACL log: $SYSVOL_ACL_RESET_LOG
+
+$(echo "$output" | tail -12)"
+        return "$rc"
+    fi
 }
 
 show_sysvol_freshness() {
@@ -1571,14 +1635,198 @@ show_sysvol_freshness() {
     info_text "SYSVOL Freshness" "${output//\\n/$'\n'}"
 }
 
-reset_sysvol_acls() {
-    yesno "Reset SYSVOL ACLs?" || return
-    # Older deployments provisioned/joined before the idmap-config fix will
-    # loop here forever with "idmap range not specified for domain '*'".
-    # Calling ensure_idmap_config is idempotent and cheap.
+_sysvol_acl_format_elapsed() {
+    local total="${1:-0}"
+    printf '%02d:%02d:%02d' \
+        "$((total / 3600))" "$(((total % 3600) / 60))" "$((total % 60))"
+}
+
+_install_sysvol_acl_reset_unit() {
+    install -d -m 0755 "$(dirname "$SYSVOL_ACL_RESET_UNIT_FILE")"
+    cat > "$SYSVOL_ACL_RESET_UNIT_FILE" <<'UNITEOF'
+[Unit]
+Description=Reset Samba SYSVOL NT ACLs
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+ConditionPathExists=/etc/samba/smb.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock --exclusive /run/sysvol-sync.lock /usr/local/sbin/samba-sconfig sysvol-acl-worker
+TimeoutStartSec=2h
+UMask=0027
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/etc/samba /var/lib/samba /var/log/samba /run
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UNITEOF
+    chmod 0644 "$SYSVOL_ACL_RESET_UNIT_FILE"
+    systemctl daemon-reload
+}
+
+_sysvol_acl_worker_body() {
+    local started finished elapsed rc
+    started=$(date +%s)
+    printf '%s SYSVOL NTACL reset started\n' "$(date '+%Y-%m-%d %H:%M:%S%z')"
+
     ensure_idmap_config
-    local output; output=$(samba-tool ntacl sysvolreset 2>&1)
-    info "ACLs reset.\n${output}"
+    rc=$?
+    if (( rc == 0 )); then
+        samba-tool ntacl sysvolreset
+        rc=$?
+    fi
+
+    finished=$(date +%s)
+    elapsed=$((finished - started))
+    if (( rc == 0 )); then
+        printf '%s SYSVOL NTACL reset completed in %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S%z')" "$(_sysvol_acl_format_elapsed "$elapsed")"
+    else
+        printf '%s SYSVOL NTACL reset FAILED (rc=%d, elapsed=%s)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S%z')" "$rc" "$(_sysvol_acl_format_elapsed "$elapsed")"
+    fi
+    return "$rc"
+}
+
+# Internal worker invoked by samba-sysvol-acl-reset.service. tee keeps a
+# durable operator log while the service's stdout remains available in the
+# journal. The pipeline status is the worker status, never tee's status.
+cli_sysvol_acl_worker() {
+    install -d -m 0750 "$(dirname "$SYSVOL_ACL_RESET_LOG")"
+    touch "$SYSVOL_ACL_RESET_LOG"
+    chmod 0640 "$SYSVOL_ACL_RESET_LOG"
+
+    local rc
+    _sysvol_acl_worker_body 2>&1 | tee -a "$SYSVOL_ACL_RESET_LOG"
+    rc=${PIPESTATUS[0]}
+    return "$rc"
+}
+
+_sysvol_acl_unit_value() {
+    local property="$1"
+    systemctl show "$SYSVOL_ACL_RESET_SERVICE" \
+        "--property=${property}" --value 2>/dev/null || printf '%s\n' unknown
+}
+
+_sysvol_acl_job_pending() {
+    systemctl list-jobs --no-legend --no-pager "$SYSVOL_ACL_RESET_SERVICE" 2>/dev/null \
+        | grep -Fq "$SYSVOL_ACL_RESET_SERVICE"
+}
+
+cli_sysvol_acl_status() {
+    local active sub result exec_status
+    active=$(_sysvol_acl_unit_value ActiveState)
+    sub=$(_sysvol_acl_unit_value SubState)
+    result=$(_sysvol_acl_unit_value Result)
+    exec_status=$(_sysvol_acl_unit_value ExecMainStatus)
+
+    cat <<EOF
+SYSVOL NTACL Reset Status
+========================
+Service: $SYSVOL_ACL_RESET_SERVICE
+State: ${active:-unknown} (${sub:-unknown})
+Result: ${result:-unknown}
+Exit status: ${exec_status:-unknown}
+Log: $SYSVOL_ACL_RESET_LOG
+EOF
+    if [[ "$active" == "activating" || "$active" == "active" ]]; then
+        echo "The reset is owned by systemd and continues if the SSH session disconnects."
+    fi
+    if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+        echo
+        echo "Recent log:"
+        tail -20 "$SYSVOL_ACL_RESET_LOG"
+    else
+        echo "No reset log has been written yet."
+    fi
+
+    [[ "$active" != "failed" && "$result" != "failed" && "$result" != "timeout" ]]
+}
+
+# Queue the permanent oneshot before announcing success, then monitor systemd's
+# job and unit state. If SSH disappears after `start --no-block` returns,
+# systemd already owns the worker; a replacement session can use
+# `samba-sconfig sysvol-acl-status` without starting a second reset.
+run_sysvol_acl_reset() {
+    if [[ ! -f "$SAMBA_CONF" ]]; then
+        echo "[sconfig] ERROR: $SAMBA_CONF is absent; provision or join the domain first." >&2
+        return 1
+    fi
+    if [[ ! -f "$SYSVOL_ACL_RESET_UNIT_FILE" ]]; then
+        echo "[sconfig] installing missing $SYSVOL_ACL_RESET_SERVICE"
+        _install_sysvol_acl_reset_unit || return 1
+    fi
+
+    systemctl reset-failed "$SYSVOL_ACL_RESET_SERVICE" 2>/dev/null || true
+    if ! systemctl start --no-block "$SYSVOL_ACL_RESET_SERVICE"; then
+        echo "[sconfig] ERROR: could not queue $SYSVOL_ACL_RESET_SERVICE." >&2
+        if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+            tail -20 "$SYSVOL_ACL_RESET_LOG" >&2
+        fi
+        return 1
+    fi
+    echo "[sconfig] SYSVOL NTACL reset started as $SYSVOL_ACL_RESET_SERVICE."
+    echo "[sconfig] It continues if this SSH session disconnects."
+    echo "[sconfig] Reconnect with: sudo samba-sconfig sysvol-acl-status"
+
+    local started now elapsed next_report active result exec_status
+    started=$(date +%s)
+    next_report="$SYSVOL_ACL_RESET_HEARTBEAT"
+
+    while true; do
+        active=$(_sysvol_acl_unit_value ActiveState)
+        if [[ "$active" != "activating" && "$active" != "active" ]] \
+           && ! _sysvol_acl_job_pending; then
+            break
+        fi
+        sleep "$SYSVOL_ACL_RESET_POLL"
+        now=$(date +%s)
+        elapsed=$((now - started))
+        if (( SYSVOL_ACL_RESET_HEARTBEAT == 0 || elapsed >= next_report )); then
+            echo "[sconfig] Resetting NTACLs: still running ($(_sysvol_acl_format_elapsed "$elapsed") elapsed)..."
+            next_report=$((elapsed + SYSVOL_ACL_RESET_HEARTBEAT))
+        fi
+    done
+
+    now=$(date +%s)
+    elapsed=$((now - started))
+    result=$(_sysvol_acl_unit_value Result)
+    exec_status=$(_sysvol_acl_unit_value ExecMainStatus)
+    if [[ "$active" != "failed" && "$result" == "success" && "$exec_status" == "0" ]]; then
+        echo "[sconfig] SYSVOL NTACL reset completed in $(_sysvol_acl_format_elapsed "$elapsed")."
+        return 0
+    fi
+
+    echo "[sconfig] ERROR: SYSVOL ACL reset service failed (state=${active:-unknown}, result=${result:-unknown}, rc=${exec_status:-unknown})." >&2
+    echo "[sconfig] Status: sudo samba-sconfig sysvol-acl-status" >&2
+    if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+        tail -20 "$SYSVOL_ACL_RESET_LOG" >&2
+    fi
+    return 1
+}
+
+reset_sysvol_acls() {
+    yesno "Reset SYSVOL ACLs?\n\nThis can take tens of minutes in a large domain. The system service continues if this SSH session disconnects." || return
+    if run_sysvol_acl_reset; then
+        info "SYSVOL ACL reset completed.\n\nLog: $SYSVOL_ACL_RESET_LOG"
+    else
+        info_text "SYSVOL ACL reset failed" "The reset service failed.
+
+Status: sudo samba-sconfig sysvol-acl-status
+Retry:  sudo samba-sconfig sysvol-acl-reset
+Log:    $SYSVOL_ACL_RESET_LOG"
+        return 1
+    fi
+}
+
+show_sysvol_acl_reset_status() {
+    local output
+    output=$(cli_sysvol_acl_status 2>&1)
+    info_text "SYSVOL ACL Reset Status" "$output"
 }
 
 show_sync_status() {
@@ -3204,16 +3452,12 @@ cli_join_dc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        if configure_domain_dfs_root_proxies; then
-            echo "[sconfig] JOIN SUCCESS (FL=$fl_str) — TLS cert has SAN, PTR registered, SYSVOL seeded, DFS roots synchronized"
-        else
-            echo "[sconfig] JOINED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
-            echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
-            return 2
-        fi
+        local sysvol_rc=0 dfs_rc=0
+        configure_domain_dfs_root_proxies || dfs_rc=$?
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _cli_report_join_outcome "$fl_str" "$sysvol_rc" "$dfs_rc"
     else
         local rc=$?
         echo "[sconfig] JOIN FAILED (rc=$rc)" >&2
@@ -3455,6 +3699,11 @@ Usage: samba-sconfig                       # interactive TUI
            required env: SC_REALM, SC_NETBIOS, SC_PASS
            optional env: SC_FWD (default: 1.1.1.1)
 
+SYSVOL ACL maintenance:
+       samba-sconfig sysvol-acl-reset      # durable reset with elapsed progress
+       samba-sconfig sysvol-acl-status     # reconnectable service status + log
+       samba-sconfig sysvol-acl-install    # reinstall the systemd service unit
+
 DFS-N (automatic domain-root compatibility):
        samba-sconfig dfs-root-sync        # sync existing domain root proxies
                                            # (also runs automatically every 5 min)
@@ -3490,6 +3739,10 @@ case "${1:-}" in
     probe-fl)       shift; cli_probe_fl "$@" ;;
     join-dc)        cli_join_dc ;;
     provision-new)  cli_provision_new ;;
+    sysvol-acl-reset)   run_sysvol_acl_reset ;;
+    sysvol-acl-status)  cli_sysvol_acl_status ;;
+    sysvol-acl-install) _install_sysvol_acl_reset_unit ;;
+    sysvol-acl-worker)  cli_sysvol_acl_worker ;;
     dfs-root-sync)  cli_dfs_root_sync ;;
     dfs-init)       cli_dfs_init ;;
     dfs-configure)  shift; cli_dfs_configure "$@" ;;

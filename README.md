@@ -286,7 +286,13 @@ caveat live in [`docs/RELEASE.md`](docs/RELEASE.md).
 ## Important Design Notes
 
 - Samba does not implement DFSR. SYSVOL replication is handled explicitly by
-  `sysvol-sync` and by SMB-based seeding after a Windows join.
+  `sysvol-sync` and by SMB-based seeding after a Windows join. Whole-tree ACL
+  resets run through `samba-sysvol-acl-reset.service`, so a large domain can
+  take as long as needed without depending on the initiating SSH connection.
+  The foreground client prints elapsed heartbeats; a replacement session can
+  inspect `samba-sconfig sysvol-acl-status` and
+  `/var/log/samba/sysvol-acl-reset.log`. A failed reset makes the join report a
+  partial failure instead of being silently ignored.
 - Existing domain-based DFS namespace roots are protected automatically
   during provision or join. The DC reads replicated root-target metadata,
   creates managed `msdfs proxy` shares, excludes itself to prevent referral
