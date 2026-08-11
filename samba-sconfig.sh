@@ -20,11 +20,12 @@
 #===============================================================================
 set -uo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.1"
 readonly SCRIPT_NAME="samba-sconfig"
 readonly WT_HEIGHT=22
 readonly WT_WIDTH=76
 readonly WT_MENU_HEIGHT=14
+readonly SAMBA_CONF="${SAMBA_SMB_CONF:-/etc/samba/smb.conf}"
 
 #===============================================================================
 # UTILITIES
@@ -42,6 +43,7 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/hostname.sh"   ]] && source "$APPCORE_LIBS/hostname.sh"
     [[ -f "$APPCORE_LIBS/detect-net.sh" ]] && source "$APPCORE_LIBS/detect-net.sh"
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
+    [[ -f "$APPCORE_LIBS/timezone.sh"   ]] && source "$APPCORE_LIBS/timezone.sh"
 fi
 
 # info / yesno / die delegate to appliance-core's sized whiptail
@@ -100,11 +102,104 @@ check_root() {
     fi
 }
 
+readonly DETECT_FILE="${SAMBA_DETECT_FILE:-/var/lib/samba-init-detected.env}"
+
+_samba_detect_cache_value() {
+    local key="$1"
+    [[ -r "$DETECT_FILE" ]] || return 0
+    awk -F= -v key="$key" '
+        $1 == key {
+            value=substr($0, index($0, "=") + 1)
+            sub(/^"/, "", value); sub(/"$/, "", value)
+            print value
+            exit
+        }
+    ' "$DETECT_FILE"
+}
+
+# Canonical deployment context. appliance-core owns live IP, gateway, DHCP
+# resolver/domain, PTR, cache freshness, and source attribution.
+refresh_detected_context() {
+    APPCORE_DET_IP="" APPCORE_DET_GATEWAY="" APPCORE_DET_DHCP_DNS=""
+    APPCORE_DET_DHCP_DOMAIN="" APPCORE_DET_PTR_DOMAIN=""
+    APPCORE_DET_EFFECTIVE_DOMAIN=""
+    if command -v appcore_detect_net_init >/dev/null 2>&1; then
+        appcore_detect_net_init "$DETECT_FILE" >/dev/null 2>&1 || true
+    else
+        # Compatibility with images built before appliance-core detection
+        # was vendored. New releases always take the branch above.
+        APPCORE_DET_IP=$(_samba_detect_cache_value DET_IP)
+        APPCORE_DET_GATEWAY=$(_samba_detect_cache_value DET_GATEWAY)
+        APPCORE_DET_DHCP_DNS=$(_samba_detect_cache_value DET_DHCP_DNS)
+        APPCORE_DET_DHCP_DOMAIN=$(_samba_detect_cache_value DET_DHCP_DOMAIN)
+        APPCORE_DET_PTR_DOMAIN=$(_samba_detect_cache_value DET_PTR_DOMAIN)
+        APPCORE_DET_EFFECTIVE_DOMAIN="${APPCORE_DET_DHCP_DOMAIN:-$APPCORE_DET_PTR_DOMAIN}"
+    fi
+}
+
+# Samba adds AD-specific SRV discovery only when a domain-operation screen
+# needs it. Routine status rendering stays fast when DNS is unavailable.
+refresh_samba_domain_context() {
+    refresh_detected_context
+    SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""
+    local domain dc cached_realm cached_dc
+    for domain in "${APPCORE_DET_DHCP_DOMAIN:-}" "${APPCORE_DET_PTR_DOMAIN:-}"; do
+        [[ -n "$domain" ]] || continue
+        dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${domain}" 2>/dev/null \
+            | awk 'NR==1 {sub(/\.$/,"",$4); print $4}') || dc=""
+        if [[ -n "$dc" ]]; then
+            SAMBA_DET_AD_DC="$dc"
+            SAMBA_DET_AD_REALM="$domain"
+            break
+        fi
+    done
+
+    # A transient SRV failure may reuse the prior DC only for the same
+    # effective realm. It must never carry a lab/previous-network DC into
+    # a different deployment.
+    if [[ -z "$SAMBA_DET_AD_DC" && -n "${APPCORE_DET_EFFECTIVE_DOMAIN:-}" ]]; then
+        cached_realm=$(_samba_detect_cache_value SAMBA_DET_AD_REALM)
+        cached_dc=$(_samba_detect_cache_value SAMBA_DET_AD_DC)
+        [[ -z "$cached_realm" ]] && cached_realm=$(_samba_detect_cache_value DET_AD_REALM)
+        [[ -z "$cached_dc" ]] && cached_dc=$(_samba_detect_cache_value DET_AD_DC)
+        local cached_realm_lc effective_realm_lc
+        cached_realm_lc=$(printf '%s' "$cached_realm" | tr '[:upper:]' '[:lower:]')
+        effective_realm_lc=$(printf '%s' "$APPCORE_DET_EFFECTIVE_DOMAIN" | tr '[:upper:]' '[:lower:]')
+        if [[ "$cached_realm_lc" == "$effective_realm_lc" ]]; then
+            SAMBA_DET_AD_REALM="$cached_realm"
+            SAMBA_DET_AD_DC="$cached_dc"
+        fi
+    fi
+
+    export SAMBA_DET_AD_DC SAMBA_DET_AD_REALM
+}
+
+set_domain_defaults() {
+    refresh_samba_domain_context
+    SAMBA_DEFAULT_REALM=$(printf '%s' "$APPCORE_DET_EFFECTIVE_DOMAIN" | tr '[:lower:]' '[:upper:]')
+    SAMBA_DEFAULT_FORWARDER="${APPCORE_DET_DHCP_DNS%% *}"
+    SAMBA_DEFAULT_DC="$SAMBA_DET_AD_DC"
+    export SAMBA_DEFAULT_REALM SAMBA_DEFAULT_FORWARDER SAMBA_DEFAULT_DC
+}
+
 get_hostname()  { hostname -s 2>/dev/null || echo "(not set)"; }
 get_fqdn()      { hostname -f 2>/dev/null || echo "(not set)"; }
-get_domain()    { dnsdomainname 2>/dev/null || echo "(not set)"; }
-get_ip()        { ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+[.\d/]+' | head -1 || echo "(not set)"; }
-get_gateway()   { ip route show default | awk '/default/{print $3}' | head -1 || echo "(not set)"; }
+get_domain() {
+    if is_provisioned; then
+        get_realm | tr '[:upper:]' '[:lower:]'
+        return
+    fi
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_EFFECTIVE_DOMAIN:-(not detected)}"
+}
+get_ip() {
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_IP:-(not set)}"
+}
+get_gateway() {
+    refresh_detected_context
+    printf '%s\n' "${APPCORE_DET_GATEWAY:-(not set)}"
+}
 get_iface()     { ip -4 route show default 2>/dev/null | awk '{print $5}' | head -1 || \
                   ip link show | awk -F: '/^[0-9]+:/{if($2!~"lo") print $2}' | tr -d ' ' | head -1; }
 
@@ -398,7 +493,7 @@ config_hostname() {
     fi
 
     # The actual rename flow lives in the appliance-core hostname.sh
-    # lib (live DHCP/PTR/dnsdomainname domain detection, NetBIOS-rules
+    # lib (canonical DHCP/PTR domain detection, NetBIOS-rules
     # short-name validation, safe /etc/hosts rewrite). The post-provision
     # guard above is the only product-specific bit; everything else is
     # shared with smb-proxy and any future appliance.
@@ -407,7 +502,8 @@ config_hostname() {
         return
     fi
 
-    if appcore_hostname_change_tui; then
+    refresh_detected_context
+    if appcore_hostname_change_tui "" "${APPCORE_DET_EFFECTIVE_DOMAIN:-}"; then
         info "Hostname set to: ${APPCORE_HOSTNAME_NEW_FQDN}\n\nReboot recommended so all services pick it up."
     fi
 }
@@ -428,8 +524,14 @@ get_addr_source() {
 }
 
 get_current_dns() {
-    # First non-comment nameserver in /etc/resolv.conf
-    awk '/^nameserver[[:space:]]/ { print $2; exit }' /etc/resolv.conf 2>/dev/null
+    refresh_detected_context
+    if [[ -n "${APPCORE_DET_DHCP_DNS:-}" ]]; then
+        printf '%s\n' "$APPCORE_DET_DHCP_DNS"
+        return
+    fi
+
+    awk '/^nameserver[[:space:]]/ { print $2; exit }' \
+        /etc/resolv.conf 2>/dev/null
 }
 
 config_network() {
@@ -445,10 +547,41 @@ config_network() {
     fi
     appcore_netconfig_change_tui_single_nic \
         /etc/netplan/60-samba-init.yaml \
-        'e*'
+        'e*' \
+        "$(get_current_dns)"
 }
 
-config_timezone() { dpkg-reconfigure tzdata; }
+config_timezone() {
+    local current suggested="" failure="" selected prompt
+    current=$(timedatectl show --property=Timezone --value 2>/dev/null || echo Etc/UTC)
+    current="${current:-Etc/UTC}"
+    if command -v appcore_timezone_suggest >/dev/null 2>&1; then
+        if appcore_timezone_suggest >/dev/null; then
+            suggested="$APPCORE_TIMEZONE_SUGGESTION"
+        else
+            failure="$APPCORE_TIMEZONE_ERROR"
+        fi
+    else
+        failure="automatic suggestion unavailable on this image"
+    fi
+
+    prompt="Current timezone: ${current}"
+    if [[ -n "$suggested" ]]; then
+        prompt+="\nDetected suggestion: ${suggested}"
+    else
+        prompt+="\n${failure}"
+    fi
+    prompt+="\n\nEnter an IANA timezone (for example America/Los_Angeles or Etc/UTC):"
+
+    selected=$(whiptail --title "Timezone" --inputbox "$prompt" \
+        14 "$WT_WIDTH" "${suggested:-$current}" 3>&1 1>&2 2>&3) || return
+    if ! timedatectl list-timezones 2>/dev/null | grep -Fxq "$selected"; then
+        info "Unknown timezone: ${selected}\n\nUse a value shown by: timedatectl list-timezones"
+        return
+    fi
+    timedatectl set-timezone "$selected"
+    info "Timezone is now ${selected}."
+}
 
 config_updates() {
     local choice
@@ -650,9 +783,10 @@ menu_domain_ops() {
 }
 
 collect_domain_info() {
+    set_domain_defaults
     DC_REALM=$(whiptail --inputbox \
         "AD Realm (UPPERCASE DNS domain name).\n\nExamples: HOME.LAN, CORP.CONTOSO.COM\nDo NOT use .local" \
-        12 64 "" 3>&1 1>&2 2>&3) || return 1
+        12 64 "$SAMBA_DEFAULT_REALM" 3>&1 1>&2 2>&3) || return 1
     [[ -z "$DC_REALM" ]] && return 1
     DC_REALM="${DC_REALM^^}"
     [[ "$DC_REALM" == *.LOCAL ]] && { info ".LOCAL conflicts with mDNS."; return 1; }
@@ -663,7 +797,7 @@ collect_domain_info() {
     DC_NETBIOS="${DC_NETBIOS^^}"
 
     DC_DNS_FORWARDER=$(whiptail --inputbox "DNS forwarder (upstream DNS for external names):" \
-        10 64 "1.1.1.1" 3>&1 1>&2 2>&3) || return 1
+        10 64 "${SAMBA_DEFAULT_FORWARDER:-1.1.1.1}" 3>&1 1>&2 2>&3) || return 1
 
     return 0
 }
@@ -732,6 +866,7 @@ apply_hardening_to_smb_conf() {
             print "\tclient signing = mandatory"
             print "\tserver min protocol = SMB3_00"
             print "\tclient min protocol = SMB3_00"
+            print "\thost msdfs = yes"
             print "\tldap server require strong auth = yes"
             print "\tkerberos encryption types = strong"
             print "\tntlm auth = mschapv2-and-ntlmv2-only"
@@ -854,8 +989,14 @@ seed_sysvol() {
             >/dev/null 2>&1; then
         if [[ -d "${tmpdir}/${realm_lower}" ]]; then
             cp -a "${tmpdir}/${realm_lower}/." "/var/lib/samba/sysvol/${realm_lower}/"
-            echo "[sconfig] SYSVOL seeded. Resetting NTACLs..."
-            samba-tool ntacl sysvolreset 2>&1 | sed 's/^/[ntacl] /' || true
+            echo "[sconfig] SYSVOL seeded. Starting durable NTACL reset..."
+            if ! run_sysvol_acl_reset; then
+                echo "[sconfig] ERROR: SYSVOL was copied, but its NTACL reset failed." >&2
+                echo "[sconfig]        Status: sudo samba-sconfig sysvol-acl-status" >&2
+                echo "[sconfig]        Retry:  sudo samba-sconfig sysvol-acl-reset" >&2
+                rm -rf "$tmpdir"
+                return 2
+            fi
             rm -rf "$tmpdir"
             return 0
         fi
@@ -864,6 +1005,60 @@ seed_sysvol() {
     echo "[sconfig]       until sysvol-sync runs. Verify SMB signing + creds on $src_dc."
     rm -rf "$tmpdir"
     return 1
+}
+
+_tui_report_join_outcome() {
+    local role="$1" fl="$2" realm="$3" sysvol_rc="$4" dfs_rc="$5" dfs_out="$6"
+    if (( sysvol_rc == 0 && dfs_rc == 0 )); then
+        info "Joined as ${role} (FL=$fl)!\nRealm: $realm"
+        return 0
+    fi
+
+    local body="The domain join succeeded, but post-join setup needs attention."
+    case "$sysvol_rc" in
+        1)
+            body+=$'\n\nSYSVOL seed failed. This DC may have missing Group Policy files.'
+            body+=$'\nCheck source-DC connectivity and credentials, then retry the join workflow before release.'
+            ;;
+        2)
+            body+=$'\n\nSYSVOL was copied, but its NTACL reset failed.'
+            body+=$'\nStatus: sudo samba-sconfig sysvol-acl-status'
+            body+=$'\nRetry:  sudo samba-sconfig sysvol-acl-reset'
+            body+=$'\nLog:    '"$SYSVOL_ACL_RESET_LOG"
+            ;;
+    esac
+    if (( dfs_rc != 0 )); then
+        body+=$'\n\nAutomatic DFS root referral setup failed. Domain namespace paths may fail when clients select this DC.'
+        body+=$'\n\n'"$dfs_out"
+        body+=$'\n\nRetry: sudo samba-sconfig dfs-root-sync'
+    fi
+    info_text "Joined with post-join warning" "$body"
+    return 1
+}
+
+_cli_report_join_outcome() {
+    local fl="$1" sysvol_rc="$2" dfs_rc="$3"
+    local failed=0
+    case "$sysvol_rc" in
+        1)
+            echo "[sconfig] JOINED, BUT SYSVOL SEED FAILED — Group Policy files may be missing" >&2
+            failed=1
+            ;;
+        2)
+            echo "[sconfig] JOINED, BUT SYSVOL ACL RESET FAILED" >&2
+            echo "[sconfig] Status: sudo samba-sconfig sysvol-acl-status" >&2
+            echo "[sconfig] Retry:  sudo samba-sconfig sysvol-acl-reset" >&2
+            failed=1
+            ;;
+    esac
+    if (( dfs_rc != 0 )); then
+        echo "[sconfig] JOINED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
+        echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
+        failed=1
+    fi
+    (( failed == 0 )) || return 2
+
+    echo "[sconfig] JOIN SUCCESS (FL=$fl) — TLS cert has SAN, PTR registered, SYSVOL seeded and ACLs reset, DFS roots synchronized"
 }
 
 # Re-point chrony at a domain time source. Called post-join / post-provision.
@@ -1013,8 +1208,23 @@ Check the full log: $prov_log"
     fi
     rm -f "$prov_log" "${prov_log}.rc"
 
+    local dfs_out="" dfs_ok=1
+    if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+        dfs_ok=0
+    fi
+
     if is_addc_running; then
-        info "Domain provisioned!\n\nRealm: $DC_REALM | NetBIOS: $DC_NETBIOS\n\nNext: Run Diagnostics (6), Post-Domain Setup (3), Hardening (5)"
+        if (( dfs_ok )); then
+            info "Domain provisioned!\n\nRealm: $DC_REALM | NetBIOS: $DC_NETBIOS\n\nNext: Run Diagnostics (6), Post-Domain Setup (3), Hardening (5)"
+        else
+            info_text "Domain provisioned with DFS warning" "The domain was provisioned, but automatic DFS root referral setup failed.
+
+Domain namespace paths may fail when clients select this DC until this is corrected.
+
+${dfs_out}
+
+Retry: sudo samba-sconfig dfs-root-sync"
+        fi
     else
         info "WARNING: samba-ad-dc not running.\n\nCheck: journalctl -u samba-ad-dc -n 50"
     fi
@@ -1026,7 +1236,7 @@ domain_join_dc() {
 
     local existing_dc
     existing_dc=$(whiptail --inputbox "FQDN or IP of existing DC to replicate from:" \
-        10 64 "" 3>&1 1>&2 2>&3) || return
+        10 64 "${SAMBA_DEFAULT_DC:-}" 3>&1 1>&2 2>&3) || return
 
     local dc_ip
     if ! dc_ip=$(resolve_dc_ip "$existing_dc"); then
@@ -1061,10 +1271,18 @@ domain_join_dc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        info "Joined as additional DC (FL=$fl_str)!\nRealm: $DC_REALM"
+        local dfs_out="" dfs_rc=0
+        if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+            dfs_rc=1
+        fi
+        # Keep the service-owned, potentially long ACL reset last. If the SSH
+        # client disappears while monitoring it, every other post-join step is
+        # already complete and systemd finishes the reset independently.
+        local sysvol_rc=0
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _tui_report_join_outcome "additional DC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "Join FAILED.\n\nCheck connectivity to $existing_dc ($dc_ip) and credentials."
     fi
@@ -1076,7 +1294,7 @@ domain_join_rodc() {
 
     local existing_dc
     existing_dc=$(whiptail --inputbox "FQDN or IP of writable DC:" \
-        10 64 "" 3>&1 1>&2 2>&3) || return
+        10 64 "${SAMBA_DEFAULT_DC:-}" 3>&1 1>&2 2>&3) || return
 
     local dc_ip
     if ! dc_ip=$(resolve_dc_ip "$existing_dc"); then
@@ -1108,10 +1326,15 @@ domain_join_rodc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        info "Joined as RODC (FL=$fl_str)!\nRealm: $DC_REALM"
+        local dfs_out="" dfs_rc=0
+        if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
+            dfs_rc=1
+        fi
+        local sysvol_rc=0
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _tui_report_join_outcome "RODC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "RODC join FAILED."
     fi
@@ -1293,6 +1516,11 @@ reset_admin_password() {
 SYSVOL_SYNC_CONF="/etc/samba/sysvol-sync.conf"
 SYSVOL_SYNC_CRON="/etc/cron.d/sysvol-sync"
 SYSVOL_SYNC_OLD_CRED="/etc/samba/sysvol-sync.cred"
+readonly SYSVOL_ACL_RESET_SERVICE="${SAMBA_SYSVOL_ACL_RESET_SERVICE:-samba-sysvol-acl-reset.service}"
+readonly SYSVOL_ACL_RESET_UNIT_FILE="${SAMBA_SYSVOL_ACL_RESET_UNIT_FILE:-/etc/systemd/system/${SYSVOL_ACL_RESET_SERVICE}}"
+readonly SYSVOL_ACL_RESET_LOG="${SAMBA_SYSVOL_ACL_RESET_LOG:-/var/log/samba/sysvol-acl-reset.log}"
+readonly SYSVOL_ACL_RESET_HEARTBEAT="${SAMBA_SYSVOL_ACL_RESET_HEARTBEAT:-15}"
+readonly SYSVOL_ACL_RESET_POLL="${SAMBA_SYSVOL_ACL_RESET_POLL:-1}"
 
 menu_sysvol_sync() {
     is_provisioned || { info "Not provisioned."; return; }
@@ -1307,6 +1535,7 @@ menu_sysvol_sync() {
             "3" "Show SYSVOL Freshness (per-GPO version table)" \
             "4" "Show Sync Status" \
             "5" "Reset SYSVOL ACLs" \
+            "6" "Show SYSVOL ACL Reset Status" \
             "B" "Back" \
             3>&1 1>&2 2>&3) || return
 
@@ -1316,6 +1545,7 @@ menu_sysvol_sync() {
             3) show_sysvol_freshness ;;
             4) show_sync_status ;;
             5) reset_sysvol_acls ;;
+            6) show_sysvol_acl_reset_status ;;
             B|b) return ;;
         esac
     done
@@ -1383,8 +1613,20 @@ run_sysvol_sync() {
     [[ -f "$SYSVOL_SYNC_CONF" ]] || { info "Not configured. Run Configure (menu 1) first."; return; }
     yesno "Run SYSVOL sync now?" || return
     whiptail --infobox "Syncing..." 6 40
-    local output; output=$(/usr/local/sbin/sysvol-sync 2>&1)
-    info "Run complete. Log: /var/log/samba/sysvol-sync.log\n\n$(echo "$output" | tail -8)"
+    local output rc
+    output=$(/usr/local/sbin/sysvol-sync 2>&1)
+    rc=$?
+    if (( rc == 0 )); then
+        info "Run complete. Log: /var/log/samba/sysvol-sync.log\n\n$(echo "$output" | tail -8)"
+    else
+        info_text "SYSVOL sync failed" "The sync or its NTACL reset failed (rc=$rc).
+
+Sync log:  /var/log/samba/sysvol-sync.log
+NTACL log: $SYSVOL_ACL_RESET_LOG
+
+$(echo "$output" | tail -12)"
+        return "$rc"
+    fi
 }
 
 show_sysvol_freshness() {
@@ -1393,14 +1635,198 @@ show_sysvol_freshness() {
     info_text "SYSVOL Freshness" "${output//\\n/$'\n'}"
 }
 
-reset_sysvol_acls() {
-    yesno "Reset SYSVOL ACLs?" || return
-    # Older deployments provisioned/joined before the idmap-config fix will
-    # loop here forever with "idmap range not specified for domain '*'".
-    # Calling ensure_idmap_config is idempotent and cheap.
+_sysvol_acl_format_elapsed() {
+    local total="${1:-0}"
+    printf '%02d:%02d:%02d' \
+        "$((total / 3600))" "$(((total % 3600) / 60))" "$((total % 60))"
+}
+
+_install_sysvol_acl_reset_unit() {
+    install -d -m 0755 "$(dirname "$SYSVOL_ACL_RESET_UNIT_FILE")"
+    cat > "$SYSVOL_ACL_RESET_UNIT_FILE" <<'UNITEOF'
+[Unit]
+Description=Reset Samba SYSVOL NT ACLs
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+ConditionPathExists=/etc/samba/smb.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock --exclusive /run/sysvol-sync.lock /usr/local/sbin/samba-sconfig sysvol-acl-worker
+TimeoutStartSec=2h
+UMask=0027
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/etc/samba /var/lib/samba /var/log/samba /run
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UNITEOF
+    chmod 0644 "$SYSVOL_ACL_RESET_UNIT_FILE"
+    systemctl daemon-reload
+}
+
+_sysvol_acl_worker_body() {
+    local started finished elapsed rc
+    started=$(date +%s)
+    printf '%s SYSVOL NTACL reset started\n' "$(date '+%Y-%m-%d %H:%M:%S%z')"
+
     ensure_idmap_config
-    local output; output=$(samba-tool ntacl sysvolreset 2>&1)
-    info "ACLs reset.\n${output}"
+    rc=$?
+    if (( rc == 0 )); then
+        samba-tool ntacl sysvolreset
+        rc=$?
+    fi
+
+    finished=$(date +%s)
+    elapsed=$((finished - started))
+    if (( rc == 0 )); then
+        printf '%s SYSVOL NTACL reset completed in %s\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S%z')" "$(_sysvol_acl_format_elapsed "$elapsed")"
+    else
+        printf '%s SYSVOL NTACL reset FAILED (rc=%d, elapsed=%s)\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S%z')" "$rc" "$(_sysvol_acl_format_elapsed "$elapsed")"
+    fi
+    return "$rc"
+}
+
+# Internal worker invoked by samba-sysvol-acl-reset.service. tee keeps a
+# durable operator log while the service's stdout remains available in the
+# journal. The pipeline status is the worker status, never tee's status.
+cli_sysvol_acl_worker() {
+    install -d -m 0750 "$(dirname "$SYSVOL_ACL_RESET_LOG")"
+    touch "$SYSVOL_ACL_RESET_LOG"
+    chmod 0640 "$SYSVOL_ACL_RESET_LOG"
+
+    local rc
+    _sysvol_acl_worker_body 2>&1 | tee -a "$SYSVOL_ACL_RESET_LOG"
+    rc=${PIPESTATUS[0]}
+    return "$rc"
+}
+
+_sysvol_acl_unit_value() {
+    local property="$1"
+    systemctl show "$SYSVOL_ACL_RESET_SERVICE" \
+        "--property=${property}" --value 2>/dev/null || printf '%s\n' unknown
+}
+
+_sysvol_acl_job_pending() {
+    systemctl list-jobs --no-legend --no-pager "$SYSVOL_ACL_RESET_SERVICE" 2>/dev/null \
+        | grep -Fq "$SYSVOL_ACL_RESET_SERVICE"
+}
+
+cli_sysvol_acl_status() {
+    local active sub result exec_status
+    active=$(_sysvol_acl_unit_value ActiveState)
+    sub=$(_sysvol_acl_unit_value SubState)
+    result=$(_sysvol_acl_unit_value Result)
+    exec_status=$(_sysvol_acl_unit_value ExecMainStatus)
+
+    cat <<EOF
+SYSVOL NTACL Reset Status
+========================
+Service: $SYSVOL_ACL_RESET_SERVICE
+State: ${active:-unknown} (${sub:-unknown})
+Result: ${result:-unknown}
+Exit status: ${exec_status:-unknown}
+Log: $SYSVOL_ACL_RESET_LOG
+EOF
+    if [[ "$active" == "activating" || "$active" == "active" ]]; then
+        echo "The reset is owned by systemd and continues if the SSH session disconnects."
+    fi
+    if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+        echo
+        echo "Recent log:"
+        tail -20 "$SYSVOL_ACL_RESET_LOG"
+    else
+        echo "No reset log has been written yet."
+    fi
+
+    [[ "$active" != "failed" && "$result" != "failed" && "$result" != "timeout" ]]
+}
+
+# Queue the permanent oneshot before announcing success, then monitor systemd's
+# job and unit state. If SSH disappears after `start --no-block` returns,
+# systemd already owns the worker; a replacement session can use
+# `samba-sconfig sysvol-acl-status` without starting a second reset.
+run_sysvol_acl_reset() {
+    if [[ ! -f "$SAMBA_CONF" ]]; then
+        echo "[sconfig] ERROR: $SAMBA_CONF is absent; provision or join the domain first." >&2
+        return 1
+    fi
+    if [[ ! -f "$SYSVOL_ACL_RESET_UNIT_FILE" ]]; then
+        echo "[sconfig] installing missing $SYSVOL_ACL_RESET_SERVICE"
+        _install_sysvol_acl_reset_unit || return 1
+    fi
+
+    systemctl reset-failed "$SYSVOL_ACL_RESET_SERVICE" 2>/dev/null || true
+    if ! systemctl start --no-block "$SYSVOL_ACL_RESET_SERVICE"; then
+        echo "[sconfig] ERROR: could not queue $SYSVOL_ACL_RESET_SERVICE." >&2
+        if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+            tail -20 "$SYSVOL_ACL_RESET_LOG" >&2
+        fi
+        return 1
+    fi
+    echo "[sconfig] SYSVOL NTACL reset started as $SYSVOL_ACL_RESET_SERVICE."
+    echo "[sconfig] It continues if this SSH session disconnects."
+    echo "[sconfig] Reconnect with: sudo samba-sconfig sysvol-acl-status"
+
+    local started now elapsed next_report active result exec_status
+    started=$(date +%s)
+    next_report="$SYSVOL_ACL_RESET_HEARTBEAT"
+
+    while true; do
+        active=$(_sysvol_acl_unit_value ActiveState)
+        if [[ "$active" != "activating" && "$active" != "active" ]] \
+           && ! _sysvol_acl_job_pending; then
+            break
+        fi
+        sleep "$SYSVOL_ACL_RESET_POLL"
+        now=$(date +%s)
+        elapsed=$((now - started))
+        if (( SYSVOL_ACL_RESET_HEARTBEAT == 0 || elapsed >= next_report )); then
+            echo "[sconfig] Resetting NTACLs: still running ($(_sysvol_acl_format_elapsed "$elapsed") elapsed)..."
+            next_report=$((elapsed + SYSVOL_ACL_RESET_HEARTBEAT))
+        fi
+    done
+
+    now=$(date +%s)
+    elapsed=$((now - started))
+    result=$(_sysvol_acl_unit_value Result)
+    exec_status=$(_sysvol_acl_unit_value ExecMainStatus)
+    if [[ "$active" != "failed" && "$result" == "success" && "$exec_status" == "0" ]]; then
+        echo "[sconfig] SYSVOL NTACL reset completed in $(_sysvol_acl_format_elapsed "$elapsed")."
+        return 0
+    fi
+
+    echo "[sconfig] ERROR: SYSVOL ACL reset service failed (state=${active:-unknown}, result=${result:-unknown}, rc=${exec_status:-unknown})." >&2
+    echo "[sconfig] Status: sudo samba-sconfig sysvol-acl-status" >&2
+    if [[ -s "$SYSVOL_ACL_RESET_LOG" ]]; then
+        tail -20 "$SYSVOL_ACL_RESET_LOG" >&2
+    fi
+    return 1
+}
+
+reset_sysvol_acls() {
+    yesno "Reset SYSVOL ACLs?\n\nThis can take tens of minutes in a large domain. The system service continues if this SSH session disconnects." || return
+    if run_sysvol_acl_reset; then
+        info "SYSVOL ACL reset completed.\n\nLog: $SYSVOL_ACL_RESET_LOG"
+    else
+        info_text "SYSVOL ACL reset failed" "The reset service failed.
+
+Status: sudo samba-sconfig sysvol-acl-status
+Retry:  sudo samba-sconfig sysvol-acl-reset
+Log:    $SYSVOL_ACL_RESET_LOG"
+        return 1
+    fi
+}
+
+show_sysvol_acl_reset_status() {
+    local output
+    output=$(cli_sysvol_acl_status 2>&1)
+    info_text "SYSVOL ACL Reset Status" "$output"
 }
 
 show_sync_status() {
@@ -1451,6 +1877,366 @@ $(tail -12 /var/log/samba/sysvol-sync.log)
 #===============================================================================
 # 4b. DFS NAMESPACE
 #
+# Every AD DC can receive a domain DFS root-referral request. Windows DFS
+# stores each domain root and its namespace-server targets in replicated AD,
+# but Samba does not turn that metadata into share-level referrals by itself.
+# The root-proxy path below mirrors those roots into managed `msdfs proxy`
+# shares. It is automatic on provision/join and periodically converges.
+#
+# This is deliberately separate from the optional tertiary namespace-server
+# feature below. A root proxy redirects the whole share to existing namespace
+# servers; the tertiary mode hosts a local namespace tree of MSDFS symlinks.
+# Mixing their configuration would create self-referral loops.
+#
+# Design rationale and operator boundaries live in docs/DFS-N.md.
+#===============================================================================
+readonly DFS_ROOT_PROXY_BEGIN="# --- samba-sconfig managed domain DFS root proxies ---"
+readonly DFS_ROOT_PROXY_END="# --- end samba-sconfig managed domain DFS root proxies ---"
+readonly DFS_SAM_DB="${SAMBA_DFS_SAM_DB:-/var/lib/samba/private/sam.ldb}"
+readonly DFS_ROOT_PROXY_LOCK="${SAMBA_DFS_ROOT_PROXY_LOCK:-/run/samba-dfs-root-proxy-sync.lock}"
+readonly DFS_ROOT_PROXY_UNIT="${SAMBA_DFS_ROOT_PROXY_UNIT:-/etc/systemd/system/samba-dfs-root-proxy-sync.service}"
+readonly DFS_ROOT_PROXY_TIMER="${SAMBA_DFS_ROOT_PROXY_TIMER:-/etc/systemd/system/samba-dfs-root-proxy-sync.timer}"
+
+# Domain namespace names become smb.conf section names. Keep the accepted
+# character set aligned with ordinary Windows share names while excluding
+# section delimiters, path separators, controls, and embedded `$` markers.
+_dfs_root_name_validate() {
+    local base="${1%\$}"
+    [[ -n "$base" && "$base" != *\$* ]] || return 1
+    (( ${#base} >= 1 && ${#base} <= 80 )) || return 1
+    local pattern='^[A-Za-z0-9._&() -]+$'
+    [[ "$base" =~ $pattern ]] || return 1
+    [[ "$base" != " "* && "$base" != *" " ]] || return 1
+    [[ "$base" != "." && "$base" != ".." ]]
+}
+
+# Return true when a root target points back to this DC. A proxy containing
+# itself loops forever, so local short and FQDN target names are always
+# removed before rendering.
+_dfs_root_target_is_local() {
+    local unc="$1" rest server short fqdn
+    rest="${unc#\\\\}"
+    server="${rest%%\\*}"
+    server=$(printf '%s' "$server" | tr '[:upper:]' '[:lower:]')
+    server="${server%.}"
+    short=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fqdn=$(hostname -f 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    fqdn="${fqdn%.}"
+    [[ -n "$server" && ( "$server" == "$short" || "$server" == "$fqdn" ) ]]
+}
+
+# Strip only the complete block owned by this feature. A missing or duplicate
+# marker is treated as corruption; never guess where operator content ends.
+_dfs_root_proxy_strip_managed_block() {
+    local input="$1" begin_count end_count begin_line end_line
+    begin_count=$(grep -Fc "$DFS_ROOT_PROXY_BEGIN" "$input" 2>/dev/null || true)
+    end_count=$(grep -Fc "$DFS_ROOT_PROXY_END" "$input" 2>/dev/null || true)
+    if (( begin_count > 1 || end_count > 1 || begin_count != end_count )); then
+        echo "[dfs-root] managed block markers are malformed in $input; refusing to rewrite" >&2
+        return 1
+    fi
+    if (( begin_count == 1 )); then
+        begin_line=$(grep -Fn "$DFS_ROOT_PROXY_BEGIN" "$input" | cut -d: -f1)
+        end_line=$(grep -Fn "$DFS_ROOT_PROXY_END" "$input" | cut -d: -f1)
+        if (( begin_line >= end_line )); then
+            echo "[dfs-root] managed block markers are reversed in $input; refusing to rewrite" >&2
+            return 1
+        fi
+    fi
+
+    # Buffer blank lines and discard only trailing ones. This keeps repeated
+    # syncs byte-stable instead of adding a blank line on every timer pass.
+    awk -v begin="$DFS_ROOT_PROXY_BEGIN" -v end="$DFS_ROOT_PROXY_END" '
+        $0 == begin { skip=1; next }
+        $0 == end   { skip=0; next }
+        skip        { next }
+        $0 == ""    { blanks=blanks ORS; next }
+        {
+            if (blanks != "") printf "%s", blanks
+            blanks=""
+            print
+        }
+    ' "$input"
+}
+
+# Convert parsed target records to "name<TAB>proxy-list". The update is
+# all-or-nothing: malformed online targets reject the entire sync, while
+# offline targets and this DC's own target are intentionally omitted.
+_dfs_root_proxy_render_parsed() {
+    local name="$1" parsed="$2"
+    _dfs_root_name_validate "$name" || {
+        echo "[dfs-root] invalid namespace name: $name" >&2
+        return 1
+    }
+
+    local priority rank state unc state_lc
+    local online=""
+    while IFS=$'\t' read -r priority rank state unc; do
+        [[ -n "$unc" ]] || continue
+        state_lc=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
+        [[ "$state_lc" == "online" ]] || continue
+        _dfs_validate_target_unc "$unc" || {
+            echo "[dfs-root/$name] invalid target: $unc" >&2
+            return 1
+        }
+        _dfs_root_target_is_local "$unc" && continue
+        online+="${priority}"$'\t'"${rank}"$'\t'"${state}"$'\t'"${unc}"$'\n'
+    done <<< "$parsed"
+
+    [[ -n "$online" ]] || {
+        echo "[dfs-root/$name] no non-local online targets; refusing a self-referral" >&2
+        return 1
+    }
+
+    local ordered target proxy=""
+    ordered=$(printf '%s' "$online" | _dfs_order_targets "") || return 1
+    while IFS= read -r target; do
+        [[ -n "$target" ]] || continue
+        # Samba's smb.conf syntax uses one leading backslash here, whereas
+        # the AD XML stores a conventional UNC with two.
+        target="${target#\\}"
+        proxy+="${proxy:+,}${target}"
+    done <<< "$ordered"
+    [[ -n "$proxy" ]] || return 1
+    printf '%s\t%s\n' "$name" "$proxy"
+}
+
+_dfs_root_proxy_render_record() {
+    local name="$1" blob="$2" parsed
+    [[ -n "$blob" ]] || {
+        echo "[dfs-root/$name] missing msDFS-TargetListv2" >&2
+        return 1
+    }
+    parsed=$(_dfs_render_targets "$blob") || {
+        echo "[dfs-root/$name] target-list parse failed" >&2
+        return 1
+    }
+    _dfs_root_proxy_render_parsed "$name" "$parsed"
+}
+
+# Domain-v1 roots predate msDFS-TargetListv2. Their multivalued
+# remoteServerName attribute is already a list of root-target UNCs, followed
+# by a literal `*` terminator. Give each usable target neutral priority and
+# pass it through the same validation/self-loop filter as v2 metadata.
+_dfs_root_proxy_render_v1_record() {
+    local name="$1" remotes="$2" unc parsed=""
+    while IFS= read -r unc; do
+        [[ -n "$unc" ]] || continue
+        [[ "$unc" == "*" ]] && continue
+        parsed+=$'siteCostNormal\t0\tonline\t'"${unc}"$'\n'
+    done <<< "$remotes"
+    [[ -n "$parsed" ]] || {
+        echo "[dfs-root/$name] domain-v1 root has no remoteServerName targets" >&2
+        return 1
+    }
+    _dfs_root_proxy_render_parsed "$name" "$parsed"
+}
+
+# Discover every replicated v2 domain namespace and atomically converge the
+# managed smb.conf block. Failed discovery, parsing, validation, collision, or
+# testparm validation leaves the last known-good file untouched.
+_dfs_sync_domain_root_proxies() (
+    [[ -f "$SAMBA_CONF" ]] || {
+        echo "[dfs-root] $SAMBA_CONF is absent; provision or join the domain first" >&2
+        return 1
+    }
+
+    exec 8>"$DFS_ROOT_PROXY_LOCK" || {
+        echo "[dfs-root] cannot open lock $DFS_ROOT_PROXY_LOCK" >&2
+        return 1
+    }
+    if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
+        echo "[dfs-root] another sync is in progress; exiting" >&2
+        return 0
+    fi
+
+    local base_dn search_base raw unwrapped
+    base_dn=$(_dfs_get_base_dn) || {
+        echo "[dfs-root] could not derive the domain base DN" >&2
+        return 1
+    }
+    # Search from CN=System so a new forest with no Dfs-Configuration
+    # container returns zero records instead of a missing-base error.
+    search_base="CN=System,${base_dn}"
+    raw=$(ldbsearch -H "$DFS_SAM_DB" -b "$search_base" -s sub \
+            '(|(objectClass=msDFS-Namespacev2)(objectClass=fTDfs))' \
+            objectClass name cn msDFS-TargetListv2 remoteServerName 2>&1) || {
+        echo "[dfs-root] namespace discovery failed:" >&2
+        printf '%s\n' "$raw" | head -3 >&2
+        return 1
+    }
+    unwrapped=$(printf '%s\n' "$raw" | _dfs_unwrap_ldif)
+
+    local records candidate installed existing
+    records=$(mktemp) || return 1
+    candidate=$(mktemp "${SAMBA_CONF}.dfs-root-proxy.XXXXXX") || {
+        rm -f "$records"
+        return 1
+    }
+    installed="${candidate}.installed"
+
+    local cur_class="" cur_name="" cur_blob="" cur_remotes="" record_failed=0
+    _dfs_root_flush_record() {
+        if [[ -n "$cur_name" || -n "$cur_blob" || -n "$cur_remotes" ]]; then
+            if [[ "$cur_class" == "fTDfs" ]]; then
+                _dfs_root_proxy_render_v1_record "$cur_name" "$cur_remotes" >> "$records" \
+                    || record_failed=1
+            else
+                _dfs_root_proxy_render_record "$cur_name" "$cur_blob" >> "$records" \
+                    || record_failed=1
+            fi
+        fi
+        cur_class=""; cur_name=""; cur_blob=""; cur_remotes=""
+    }
+    local line
+    while IFS= read -r line; do
+        case "$line" in
+            'dn: '*)                    _dfs_root_flush_record ;;
+            '')                         _dfs_root_flush_record ;;
+            'objectClass: fTDfs')       cur_class="fTDfs" ;;
+            'name: '*)                  cur_name="${line#name: }" ;;
+            'cn: '*)                    cur_name="${line#cn: }" ;;
+            'msDFS-TargetListv2:: '*)   cur_blob="${line#msDFS-TargetListv2:: }" ;;
+            'remoteServerName: '*)      cur_remotes+="${line#remoteServerName: }"$'\n' ;;
+        esac
+    done <<< "$unwrapped"
+    _dfs_root_flush_record
+    if (( record_failed )); then
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if [[ ! -s "$records" ]] && ! grep -Fq "$DFS_ROOT_PROXY_BEGIN" "$SAMBA_CONF"; then
+        rm -f "$records" "$candidate" "$installed"
+        echo "[dfs-root] no domain namespaces detected"
+        return 0
+    fi
+
+    if ! _dfs_root_proxy_strip_managed_block "$SAMBA_CONF" > "$candidate"; then
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    # Any case-insensitive collision outside our old managed block belongs to
+    # Samba or the operator. Refuse to shadow it with an AD-derived share.
+    existing=$(awk '/^[[:space:]]*\[[^]]+\][[:space:]]*(#.*)?$/ {
+        name=$0
+        sub(/^[[:space:]]*\[/,"",name)
+        sub(/\][[:space:]]*(#.*)?$/,"",name)
+        print tolower(name)
+    }' "$candidate")
+    local name proxy name_lc duplicate="" collision=""
+    while IFS=$'\t' read -r name proxy; do
+        [[ -n "$name" ]] || continue
+        name_lc=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+        if grep -Fxq -- "$name_lc" <<< "$existing"; then
+            collision="existing share [$name] conflicts with the domain namespace"
+            break
+        fi
+        if grep -Fxiq -- "$name" <<< "$duplicate"; then
+            collision="duplicate namespace name in AD: $name"
+            break
+        fi
+        duplicate+="${name}"$'\n'
+    done < "$records"
+    if [[ -n "$collision" ]]; then
+        echo "[dfs-root] ${collision}; refusing to overwrite the configuration" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if [[ -s "$records" ]]; then
+        {
+            printf '\n%s\n' "$DFS_ROOT_PROXY_BEGIN"
+            printf '# Generated from replicated AD namespace-root metadata.\n'
+            while IFS=$'\t' read -r name proxy; do
+                [[ -n "$name" ]] || continue
+                printf '[%s]\n' "$name"
+                printf '    msdfs root = yes\n'
+                printf '    msdfs proxy = %s\n\n' "$proxy"
+            done < <(LC_ALL=C sort -f -t $'\t' -k1,1 "$records")
+            printf '%s\n' "$DFS_ROOT_PROXY_END"
+        } >> "$candidate"
+    fi
+
+    if cmp -s "$candidate" "$SAMBA_CONF"; then
+        rm -f "$records" "$candidate" "$installed"
+        echo "[dfs-root] domain namespace proxies already current"
+        return 0
+    fi
+    if ! testparm -s "$candidate" >/dev/null 2>&1; then
+        echo "[dfs-root] generated Samba configuration failed testparm; keeping the prior file" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+
+    if ! cp -p "$SAMBA_CONF" "$installed" \
+            || ! cat "$candidate" > "$installed" \
+            || ! mv "$installed" "$SAMBA_CONF"; then
+        echo "[dfs-root] failed to install generated Samba configuration" >&2
+        rm -f "$records" "$candidate" "$installed"
+        return 1
+    fi
+    rm -f "$records" "$candidate"
+    if ! smbcontrol all reload-config >/dev/null 2>&1; then
+        echo "[dfs-root] configuration installed, but Samba reload failed" >&2
+        return 1
+    fi
+    echo "[dfs-root] domain namespace proxies updated"
+)
+
+_dfs_install_root_proxy_timer() {
+    install -d -m 0755 "$(dirname "$DFS_ROOT_PROXY_UNIT")"
+    cat > "$DFS_ROOT_PROXY_UNIT" <<'UNITEOF'
+[Unit]
+Description=Samba domain DFS root proxy sync
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/samba-sconfig dfs-root-sync
+ProtectSystem=strict
+ProtectHome=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ReadWritePaths=/etc/samba /run
+ReadOnlyPaths=/var/lib/samba
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+UNITEOF
+    cat > "$DFS_ROOT_PROXY_TIMER" <<'TIMEREOF'
+[Unit]
+Description=Periodic Samba domain DFS root proxy sync
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+RandomizedDelaySec=1min
+Persistent=true
+Unit=samba-dfs-root-proxy-sync.service
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+    systemctl daemon-reload
+    systemctl enable --now samba-dfs-root-proxy-sync.timer
+}
+
+configure_domain_dfs_root_proxies() {
+    local rc=0
+    _dfs_sync_domain_root_proxies || rc=1
+    _dfs_install_root_proxy_timer || {
+        echo "[dfs-root] failed to install periodic convergence timer" >&2
+        rc=1
+    }
+    return "$rc"
+}
+
+#===============================================================================
+# 4c. DFS TERTIARY NAMESPACE SERVER
+#
 # Tertiary domain-based DFS-N namespace server. The Windows-side admin
 # adds this DC as a low-priority namespace root target; this code reads
 # the (replicated) AD link metadata and materializes it as MSDFS symlinks
@@ -1477,8 +2263,14 @@ readonly DFS_LOG="/var/log/samba/dfs-update.log"
 # Lower-cased on output. Returns 1 if smb.conf has no realm.
 _dfs_get_base_dn() {
     local realm
-    realm=$(grep -oP '^[[:space:]]*realm[[:space:]]*=[[:space:]]*\K.*' \
-                /etc/samba/smb.conf 2>/dev/null | head -1 | tr A-Z a-z | tr -d '[:space:]\r')
+    realm=$(awk -F= '
+        tolower($1) ~ /^[[:space:]]*realm[[:space:]]*$/ {
+            value=substr($0, index($0, "=") + 1)
+            gsub(/[[:space:]\r]/, "", value)
+            print tolower(value)
+            exit
+        }
+    ' "$SAMBA_CONF" 2>/dev/null)
     [[ -z "$realm" ]] && return 1
     local IFS=. parts=()
     read -r -a parts <<< "$realm"
@@ -1535,7 +2327,13 @@ _dfs_normalize_link_path() {
 _dfs_validate_target_unc() {
     local unc="$1"
     if command -v appcore_id_unc_validate >/dev/null 2>&1; then
-        appcore_id_unc_validate "$unc"
+        appcore_id_unc_validate "$unc" || return 1
+        # DFS referral targets here must stop at server\share. The shared UNC
+        # primitive also accepts subpaths for other consumers, so enforce this
+        # narrower contract after its structural validation.
+        local appcore_rest="${unc#\\\\}"
+        local appcore_after="${appcore_rest#*\\}"
+        [[ "$appcore_after" != *\\* ]]
         return
     fi
     # Fallback (kept terse): reject anything that could corrupt the
@@ -1576,7 +2374,7 @@ _dfs_render_targets() {
 
 # Order targets first by AD-sourced priorityClass (DFS-N convention:
 # globalHigh, siteCostHigh, siteCostNormal, siteCostLow, globalLow), then
-# move SC_DFS_PREFER-regex matches to the front of each priority bucket.
+# move SC_DFS_PREFER-regex matches to the front of equal class/rank targets.
 # Operator-supplied prefer thus refines AD priority; it can't override it
 # (which would defeat the point of the Windows-side priority configuration).
 #
@@ -1590,9 +2388,9 @@ _dfs_order_targets() {
         [[ -z "$rec" ]] && continue
         recs+=("$rec")
     done
-    # AWK does the multi-key sort: numeric class rank, then prefer match,
-    # then preserve original order via line number. Bash 3.2 doesn't have
-    # multi-key sort; awk is everywhere and keeps the logic readable.
+    # AWK does the multi-key sort: class, AD priority rank, prefer match,
+    # then original order. AD priority remains authoritative; the optional
+    # regex only breaks ties within the same class and rank.
     printf '%s\n' "${recs[@]}" | awk -F'\t' -v prefer="$prefer" '
         BEGIN {
             cls["globalHigh"]=0; cls["siteCostHigh"]=1; cls["siteCostNormal"]=2;
@@ -1600,10 +2398,11 @@ _dfs_order_targets() {
         }
         {
             c = (($1 in cls) ? cls[$1] : 9)
+            r = ($2 ~ /^[0-9]+$/ ? $2 : 0)
             p = (prefer != "" && $4 ~ prefer) ? 0 : 1
-            printf "%d\t%d\t%06d\t%s\n", c, p, NR, $4
+            printf "%d\t%09d\t%d\t%06d\t%s\n", c, r, p, NR, $4
         }
-    ' | sort -t $'\t' -k1,1n -k2,2n -k3,3n | awk -F'\t' '{print $4}'
+    ' | sort -t $'\t' -k1,1n -k2,2n -k3,3n -k4,4n | awk -F'\t' '{print $5}'
 }
 
 # Atomic-swap a msdfs symlink. Caller passes the full literal symlink target
@@ -1967,8 +2766,8 @@ _dfs_apply_one_link() {
         }
     done <<< "$tsv_records"
 
-    # Order by AD priority class first, then by prefer regex within each
-    # bucket. Output is one UNC per line.
+    # Order by AD priority class/rank first, then by prefer regex among ties.
+    # Output is one UNC per line.
     local ordered
     ordered=$(printf '%s\n' "$tsv_records" | _dfs_order_targets "${DFS_PREFER:-}")
 
@@ -2100,7 +2899,7 @@ tui_dfs_configure() {
         "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-80 chars, letters/digits/dot/underscore/dash.\nA trailing \$ marks the namespace as hidden in network browsing\n(e.g. Engineering\$, Public\$)." \
         14 76 "${DFS_NAMESPACES:-}" 3>&1 1>&2 2>&3) || return
     prefer=$(whiptail --inputbox \
-        "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of each priority bucket. Leave blank to use AD priorityClass only.\nExample: ^\\\\\\\\WIN-" \
+        "Prefer-regex (extended regex). UNCs matching this are bubbled to the\nfront of equal-priority targets. Leave blank to use AD priority only.\nExample: ^\\\\\\\\WIN-" \
         13 72 "${DFS_PREFER:-}" 3>&1 1>&2 2>&3) || return
     # Delegate to the CLI subcommand so name validation is shared.
     local out
@@ -2653,10 +3452,12 @@ cli_join_dc() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
-        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
         configure_chrony_for_domain "$dc_ip"
         _generate_tls_cert_core
-        echo "[sconfig] JOIN SUCCESS (FL=$fl_str) — TLS cert has SAN, PTR registered, SYSVOL seeded"
+        local sysvol_rc=0 dfs_rc=0
+        configure_domain_dfs_root_proxies || dfs_rc=$?
+        seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        _cli_report_join_outcome "$fl_str" "$sysvol_rc" "$dfs_rc"
     else
         local rc=$?
         echo "[sconfig] JOIN FAILED (rc=$rc)" >&2
@@ -2688,7 +3489,13 @@ cli_provision_new() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         _generate_tls_cert_core
-        echo "[sconfig] PROVISION SUCCESS (realm=$DC_REALM, netbios=$DC_NETBIOS)"
+        if configure_domain_dfs_root_proxies; then
+            echo "[sconfig] PROVISION SUCCESS (realm=$DC_REALM, netbios=$DC_NETBIOS)"
+        else
+            echo "[sconfig] PROVISIONED, BUT DFS ROOT SYNC FAILED — domain namespace paths through this DC may be unavailable" >&2
+            echo "[sconfig] Retry: sudo samba-sconfig dfs-root-sync" >&2
+            return 2
+        fi
     else
         local rc=$?
         echo "[sconfig] PROVISION FAILED (rc=$rc)" >&2
@@ -2783,6 +3590,10 @@ cli_dfs_update() {
     _dfs_run_update
 }
 
+cli_dfs_root_sync() {
+    _dfs_sync_domain_root_proxies
+}
+
 cli_dfs_schedule_inner() {
     local interval="$1"
     [[ -n "$interval" ]] || { echo "[dfs-schedule] interval required" >&2; return 1; }
@@ -2797,6 +3608,17 @@ cli_dfs_schedule() {
 }
 
 cli_dfs_status() {
+    local root_proxy_count root_timer
+    root_proxy_count=$(awk -v begin="$DFS_ROOT_PROXY_BEGIN" -v end="$DFS_ROOT_PROXY_END" '
+        $0 == begin { managed=1; next }
+        $0 == end   { managed=0; next }
+        managed && /^\[[^]]+\]$/ { count++ }
+        END { print count+0 }
+    ' "$SAMBA_CONF" 2>/dev/null)
+    root_timer=$(systemctl is-active samba-dfs-root-proxy-sync.timer 2>/dev/null)
+    echo "Root proxies: ${root_proxy_count:-0}"
+    echo "Root timer:   ${root_timer:-unknown}"
+    echo
     echo "Drop-in:    ${DFS_INCLUDE_FILE} $([[ -f $DFS_INCLUDE_FILE ]] && echo present || echo absent)"
     echo "Config:     ${DFS_CONF} $([[ -f $DFS_CONF ]] && echo present || echo absent)"
     if [[ -f "$DFS_CONF" ]]; then
@@ -2877,7 +3699,16 @@ Usage: samba-sconfig                       # interactive TUI
            required env: SC_REALM, SC_NETBIOS, SC_PASS
            optional env: SC_FWD (default: 1.1.1.1)
 
-DFS-N (domain-based namespace tertiary target):
+SYSVOL ACL maintenance:
+       samba-sconfig sysvol-acl-reset      # durable reset with elapsed progress
+       samba-sconfig sysvol-acl-status     # reconnectable service status + log
+       samba-sconfig sysvol-acl-install    # reinstall the systemd service unit
+
+DFS-N (automatic domain-root compatibility):
+       samba-sconfig dfs-root-sync        # sync existing domain root proxies
+                                           # (also runs automatically every 5 min)
+
+DFS-N (optional tertiary namespace target):
        samba-sconfig dfs-init              # install drop-in share + sentinel
            optional env: SC_DFS_ROOT (default: ${DFS_DEFAULT_ROOT})
                          SC_DFS_SHARE (default: ${DFS_DEFAULT_SHARE})
@@ -2897,6 +3728,10 @@ USAGE
 #===============================================================================
 # ENTRY
 #===============================================================================
+if [[ "${SAMBA_SCONFIG_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0
+fi
+
 check_root
 
 case "${1:-}" in
@@ -2904,6 +3739,11 @@ case "${1:-}" in
     probe-fl)       shift; cli_probe_fl "$@" ;;
     join-dc)        cli_join_dc ;;
     provision-new)  cli_provision_new ;;
+    sysvol-acl-reset)   run_sysvol_acl_reset ;;
+    sysvol-acl-status)  cli_sysvol_acl_status ;;
+    sysvol-acl-install) _install_sysvol_acl_reset_unit ;;
+    sysvol-acl-worker)  cli_sysvol_acl_worker ;;
+    dfs-root-sync)  cli_dfs_root_sync ;;
     dfs-init)       cli_dfs_init ;;
     dfs-configure)  shift; cli_dfs_configure "$@" ;;
     dfs-update)     cli_dfs_update ;;

@@ -20,9 +20,10 @@ Build and test a Samba Active Directory Domain Controller appliance on Debian
 - `samba-sconfig.sh`: whiptail TUI plus headless CLI for provision, join,
   hardening, diagnostics, and service maintenance.
 
-This repo is one of five siblings under `Debian-SAMBA/` (alongside
-`dev-commons`, `lab-kit`, `lab-router`, and `smb-proxy-appliance`).
-It consumes `lab-kit` and `lab-router` at runtime; see
+This repo is one of six siblings under `Debian-SAMBA/` (alongside
+`dev-commons`, `lab-kit`, `lab-router`, `appliance-core`, and
+`smb-proxy-appliance`). It consumes `lab-kit` and `lab-router` at runtime
+and vendors `appliance-core` during image preparation; see
 [`../dev-commons/REPO-SPLIT.md`](../dev-commons/REPO-SPLIT.md) for the
 full sibling layout, dependency map, and per-repo scope.
 
@@ -134,10 +135,10 @@ bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 ## Important Samba Interop Notes
 
 - Samba does not implement DFSR. SYSVOL must be seeded or synced out of band.
-- DFS-N (domain-based) is implemented in `samba-sconfig dfs-*` for
-  tertiary-target deployments. AD-replicated `msDFS-Linkv2` objects are
-  materialized as MSDFS symlinks; see `docs/DFS-N.md` for the parsing
-  strategy, the adversarial-input rules, and the operator boundary.
+- Every provision/join automatically mirrors AD domain DFS roots into managed
+  `msdfs proxy` shares and keeps them converged. The separate optional
+  tertiary-target mode materializes AD-replicated `msDFS-Linkv2` objects as
+  MSDFS symlinks. See `docs/DFS-N.md` for both boundaries, parsing, and tests.
 - The join path probes target forest functional level because Samba's default
   can be too low for modern Windows forests.
 - The join path registers this DC's PTR record because Windows KCC can cache

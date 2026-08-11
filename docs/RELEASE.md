@@ -45,6 +45,13 @@ If you don't already have one, or want a fresh master with the latest
 lab/build-fresh-base.sh -f
 ```
 
+The build refuses to start unless both `samba-addc-appliance` and the
+sibling `appliance-core` checkout are clean Git worktrees. The resulting
+`/etc/appliance-core.provenance` records both commits and their clean
+state. Before the `deploy-master` checkpoint, preparation replaces the
+lab FQDN with the neutral short hostname `samba-dc1` and removes the
+cloud-init build seed.
+
 That produces both `deploy-master` (host-agnostic, ship-this-one) and
 `golden-image` (Hyper-V-tailored, used by the test scenarios). About 7
 minutes from a warm cache.
@@ -54,6 +61,16 @@ minutes from a warm cache.
 ```bash
 lab/export-deploy-master.sh
 ```
+
+For a single portable exchange archive without parallel disk formats:
+
+```bash
+lab/export-deploy-master.sh --ova-only
+```
+
+OVA-only mode writes the generic `.ova` and `SHA256SUMS`. Its
+streamOptimized VMDK is created in a temporary directory and removed
+after ovftool bundles it into the archive.
 
 Defaults: VM=`samba-dc1`, snapshot=`deploy-master`, version=today's date
 (`Y.M.D`). Override with `-V 2026.04.27` to set a specific version
@@ -68,8 +85,9 @@ The script:
 3. The .vhdx is copied to `dist/<version>/` on the Mac and converted by
    `qemu-img` into qcow2 (compat=1.1) and streamOptimized vmdk.
 4. A minimal .vmx (vmx-19, EFI, Secure Boot off, 2 vCPU, 2 GB RAM,
-   pvscsi disk + vmxnet3 NIC, debian12-64 guestOS) is fed to ovftool to
-   bundle the vmdk into a sha256-manifested .ova.
+   IDE disk + E1000 NIC, debian12-64 guestOS) is fed to ovftool to
+   bundle the vmdk into one generic, sha256-manifested .ova. These
+   conservative virtual devices are broadly supported by OVF consumers.
 5. `shasum -a 256` over all four artifacts produces `SHA256SUMS`.
 6. The host-side export tree is removed (use `--keep-export` to retain
    it for inspection).
@@ -82,8 +100,8 @@ The script:
 /Volumes/Data/Developer/Debian-SAMBA/ovftool/ovftool dist/<ver>/<name>.ova
 ```
 
-Expected: 1 disk (20 GB capacity, ~1.4 GB sparse), 2 vCPU, 2 GB RAM,
-vmxnet3 NIC, vmx-19, debian12_64guest.
+Expected: 1 IDE disk (20 GB capacity, ~1.4 GB sparse), 2 vCPU, 2 GB RAM,
+E1000 NIC, vmx-19, debian12_64guest.
 
 ### Verify before distribution
 
@@ -278,10 +296,11 @@ need one of them to work:
 3. **TTY1 console wizard.** Open the hypervisor's console on a freshly
    deployed VM and you land directly in `samba-init`, a whiptail-driven
    setup wizard. From there you can configure the network (DHCP or
-   static), change the password, paste your own SSH public key, set the
-   hostname, and view the `samba-firstboot` log — all without any
-   network connectivity. This is the path to use when DHCP didn't work
-   on the deployment network and SSH therefore can't reach the VM.
+   static), change the password, add your own SSH public key, set the
+   hostname and timezone, and view the `samba-firstboot` log — all
+   without any network connectivity. This is the path to use when DHCP
+   didn't work on the deployment network and SSH therefore can't reach
+   the VM.
 
 ### The TTY1 setup wizard
 
@@ -297,11 +316,20 @@ Wizard menu:
 | 1 | Show network & setup status | Hostname, all NIC IPs, default route, DNS, AD-DC service state — pure read-only |
 | 2 | Configure network | DHCP or static; writes `/etc/netplan/60-samba-init.yaml` and runs `netplan apply` |
 | 3 | Change debadmin password | Required before "Mark setup complete" succeeds |
-| 4 | Add an SSH authorized_keys entry | Paste a pubkey; appended to `~debadmin/.ssh/authorized_keys` |
+| 4 | Add an SSH authorized_keys entry | Paste a complete key, or type an Ed25519 key as four validated 17-character parts; fingerprint is confirmed before appending |
 | 5 | Set hostname | NetBIOS-compatible (1-15 chars, starts with a letter) |
-| 6 | Show samba-firstboot log | Diagnostics from the host-tailoring step |
+| 6 | Set timezone | Prefers validated DHCP option 101; otherwise offers a bounded IP-geolocation suggestion |
+| 7 | Show samba-firstboot log | Diagnostics from the host-tailoring step |
 | S | Drop to a root shell | Escape hatch for when the wizard isn't enough |
 | D | Mark setup complete and proceed to login | Refused while default password is still active |
+
+For QEMU/KVM deployments whose browser console is based on noVNC
+(including Synology VMM), ordinary browser paste does not reach a Linux
+text console. In Chrome, the optional
+[`KVM Console Paste`](https://chromewebstore.google.com/detail/kvm-console-paste/acogolacfpbgbddopekjchlckaggmjkd)
+extension can simulate the necessary keystrokes after it is allowed for
+the VMM site. If browser extensions are not permitted, use the wizard's
+four-part Ed25519 entry method instead.
 
 To re-arm the wizard after marking it done (for example, to re-test the
 flow on a re-imaged VM), reverse the marker:
@@ -362,6 +390,20 @@ The TUI walks you through:
    discovery).
 3. **Security Hardening** → applies signing/min-protocol/etc. settings
    to `smb.conf`.
+
+An existing forest can have thousands of SYSVOL entries. The join's final ACL
+reset therefore runs as `samba-sysvol-acl-reset.service`, not as a child of the
+SSH session. The TUI prints elapsed heartbeats while it waits. If the connection
+drops, the reset continues; reconnect and inspect it with:
+
+```bash
+sudo samba-sconfig sysvol-acl-status
+```
+
+Full output and the completion duration are retained in
+`/var/log/samba/sysvol-acl-reset.log`. Retry a failed reset with
+`sudo samba-sconfig sysvol-acl-reset`; the join reports a partial failure until
+that succeeds.
 
 For unattended deployments, the headless CLI subcommands are:
 
