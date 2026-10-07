@@ -35,6 +35,23 @@ The generic pipeline (from `lab-kit`) is:
 7. `post_hook`.
 8. Transcript is written to `test-results/<scenario>-<timestamp>.log`.
 
+### Initial-setup input boxes
+
+The headless scenario commands remain the primary way to test appliance
+behavior. For console-only interaction and rendering, run:
+
+```bash
+tests/run-tui-inputbox-harness.sh
+```
+
+The harness extracts the actual generated `samba-init`, opens its real
+console dialogs in an 80x24 `tmux` PTY, and enters every Ed25519 key chunk
+separately. It asserts that the ruler and input cursor are adjacent and
+column-aligned, exercises overlength and invalid-character retries, and
+verifies that both typed and pasted keys are returned exactly. It also saves a
+text capture of each rendered box. On non-Linux development hosts the wrapper
+runs the same harness in a disposable Debian 13 container.
+
 ## Existing Scenarios
 
 The implemented scenarios cover the full join + provision + DFS path
@@ -116,6 +133,9 @@ What it covers today:
 - Windows-side DNS/PTR behavior.
 - Forced KCC after PTR creation.
 - Initial SYSVOL seed from `//WS2025-DC1/sysvol`.
+- The service-owned SYSVOL NTACL reset reaches `inactive/dead`, reports
+  `Result=success`, and records a completion duration in
+  `/var/log/samba/sysvol-acl-reset.log`.
 - Samba-side DRS health.
 - Windows-side replication verification.
 - TLS certificate SAN presence.
@@ -134,13 +154,18 @@ lab/run-scenario.sh join-dc --verify-only
 
 ### `dfs-namespace`
 
-Purpose: prove the Samba DC can serve as a tertiary domain-based DFS-N
-namespace target — read AD-replicated link metadata, validate it against
-adversarial input, materialize MSDFS symlinks, and refuse to prune in
-unsafe states. Background and design in [`DFS-N.md`](DFS-N.md).
+Purpose: prove both DFS-N responsibilities: a normal DC join automatically
+proxies existing domain namespace roots, and the separately configured
+tertiary mode can read replicated link metadata, validate adversarial input,
+materialize MSDFS symlinks, and refuse unsafe pruning. Background and design
+in [`DFS-N.md`](DFS-N.md).
 
 What it covers:
 
+- The join creates a managed root-proxy share for `\\lab.test\Public` before
+  tertiary setup begins, and enables its five-minute convergence timer.
+- A Windows client opens both `\\samba-dc1.lab.test\Public` and
+  `\\lab.test\Public` after flushing cached referrals.
 - `samba-sconfig dfs-init` writes a `conf.d` drop-in (read-only namespace
   share, msdfs root) and the global sentinel.
 - `samba-sconfig dfs-configure` records namespaces and the prefer-regex.
@@ -183,11 +208,11 @@ Lab-side prerequisites:
 - `Reset-DfsnTestNamespace.ps1` — idempotent teardown for re-runs.
 
 All three are staged automatically by the runner. The scenario does
-**not** register the Samba DC as a namespace root target — that
-requires the appliance to already be joined and serving the share,
-and `New-DfsnRootTarget` validates target reachability. Tertiary-
-priority registration is a deployment-time concern, not part of the
-test surface.
+**not** register the Samba DC as a namespace root target — the automatic
+root proxy must redirect to existing Windows namespace servers, not back
+to itself. Registering this DC is only needed for the optional tertiary
+mode, after its hosted namespace share exists. Tertiary-priority
+registration remains a deployment-time concern, not part of this test.
 
 ### `sysvol-sync-stale-then-pull`
 
@@ -266,8 +291,10 @@ Assertions:
   world-readable files.
 - `sysvol-sync` pulls from `//WS2025-DC1/sysvol`.
 - Deleted and changed files converge locally.
-- `samba-tool ntacl sysvolreset` completes.
-- Logs are written to `/var/log/samba/sysvol-sync.log`.
+- `samba-sysvol-acl-reset.service` completes and serializes the whole-tree
+  reset rather than tying it to the cron or SSH client process.
+- Sync logs are written to `/var/log/samba/sysvol-sync.log`; reset output and
+  duration are written to `/var/log/samba/sysvol-acl-reset.log`.
 - The scheduled cron entry or future systemd timer exists and runs.
 
 Why it matters: Samba has no DFSR, so this is not optional operational glue.
@@ -385,6 +412,9 @@ place; reuse them):
   `provision-new` scenario)
 - `samba-sconfig join-dc` — additional-DC join (used by `join-dc`
   scenario)
+- `samba-sconfig sysvol-acl-reset` / `sysvol-acl-status` — start the durable
+  ACL reset or inspect it from a replacement SSH session
+- `samba-sconfig dfs-root-sync` — automatic domain-root compatibility
 - `samba-sconfig dfs-init` / `dfs-configure` / `dfs-update` /
   `dfs-schedule` / `dfs-status` / `dfs-remove` — DFS-N command
   family (used by `dfs-namespace`)

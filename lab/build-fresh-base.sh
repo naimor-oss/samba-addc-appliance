@@ -24,6 +24,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
 
 # Defaults intentionally match lab/samba.env so a flagless invocation
 # produces samba-dc1 ready for the existing scenarios.
@@ -89,8 +90,32 @@ step() { echo
 
 ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 ssh_vm()   { ssh -J "${HV_USER}@${HV_HOST}" \
+                 -o IdentitiesOnly=yes -o IdentityAgent=none \
                  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
                  "${VM_USER}@${VM_IP}" "$@"; }
+
+require_clean_source() {
+    local repo="$1" label="$2" dirty
+    git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+        say "$label is not a git worktree: $repo"
+        exit 1
+    }
+    dirty=$(git -C "$repo" status --porcelain --untracked-files=normal)
+    if [[ -n "$dirty" ]]; then
+        say "$label has uncommitted source changes; refusing a non-reproducible release build"
+        printf '%s\n' "$dirty"
+        exit 1
+    fi
+}
+
+# Resolve both source identities before touching the lab VM. Files copied
+# below are therefore guaranteed to match the commits written into the image.
+require_clean_source "$REPO_DIR" "samba-addc-appliance"
+require_clean_source "$APPCORE_REPO" "appliance-core"
+SAMBA_BUILD_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD)"
+say "  samba-addc-appliance source commit: $SAMBA_BUILD_COMMIT"
+say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
 
 # 0. Tear down any existing VM first. The DVD attachment of the prior seed
 # ISO (mounted on the dead VM) locks the file across the SMB share — if we
@@ -126,8 +151,14 @@ else
 fi
 
 step "1. stage base VHDX + seed ISO"
-"$SCRIPT_DIR/stage-samba-base.sh" \
-    -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" "${STAGER_KEY_ARGS[@]}" -s "$ISO_DIR_MAC"
+if [[ ${#STAGER_KEY_ARGS[@]} -gt 0 ]]; then
+    "$SCRIPT_DIR/stage-samba-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" \
+        "${STAGER_KEY_ARGS[@]}" -s "$ISO_DIR_MAC"
+else
+    "$SCRIPT_DIR/stage-samba-base.sh" \
+        -n "$VM_NAME" -d "$DOMAIN" -u "$VM_USER" -s "$ISO_DIR_MAC"
+fi
 
 step "2. push host-side helper scripts to $STAGE_DIR_HOST"
 mkdir -p "$STAGE_DIR_MAC"
@@ -145,6 +176,7 @@ step "4. wait for cloud-init + SSH on $VM_IP (up to 180s)"
 ssh_up=0
 for _ in $(seq 1 90); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" true 2>/dev/null; then
         ssh_up=1
@@ -158,6 +190,7 @@ ssh_vm 'hostname; ip -4 addr show | grep -E "inet " | head -3; \
 
 step "5. push appliance scripts and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$REPO_DIR/prepare-image.sh" "$REPO_DIR/samba-sconfig.sh" \
     "${VM_USER}@${VM_IP}:/tmp/"
@@ -166,25 +199,21 @@ scp -J "${HV_USER}@${HV_HOST}" \
 # repo. prepare-image.sh §18b looks for them at /tmp/lib/. The
 # appliance-core checkout lives at $REPO_DIR/../appliance-core per
 # REPO-SPLIT.md.
-APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
 if [[ ! -d "$APPCORE_REPO/lib" ]]; then
     say "appliance-core lib/ not found at $APPCORE_REPO/lib"
     say "set \$APPCORE_REPO if the sibling lives elsewhere"
     exit 1
 fi
 scp -J "${HV_USER}@${HV_HOST}" -r \
+    -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "$APPCORE_REPO/lib" \
     "${VM_USER}@${VM_IP}:/tmp/"
 
 step "6. run prepare-image.sh on $VM_NAME"
-# Compute the appliance-core source-tree commit on the Mac and pass
-# through; the appliance image has no git, so this is the only correct
-# way to record provenance. See appliance-core/prepare-image.sh §12 and
-# decisions/0002-appliance-core.md §"Versioning + identity".
-APPCORE_BUILD_COMMIT="$(git -C "$APPCORE_REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-say "  appliance-core source commit: $APPCORE_BUILD_COMMIT"
-if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' bash /tmp/prepare-image.sh"; then
+# The appliance has no git, so source identities must cross the build
+# boundary explicitly.
+if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' SAMBA_BUILD_COMMIT='$SAMBA_BUILD_COMMIT' SOURCE_TREE_STATE=clean bash /tmp/prepare-image.sh"; then
     say "prepare-image.sh failed"
     ssh_vm 'sudo tail -30 /var/log/samba-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1
@@ -223,6 +252,7 @@ say "wait for samba-firstboot.done marker (up to 120s)"
 done_marker=0
 for _ in $(seq 1 60); do
     if ssh -o ConnectTimeout=3 -o BatchMode=yes \
+           -o IdentitiesOnly=yes -o IdentityAgent=none \
            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
            -J "${HV_USER}@${HV_HOST}" "${VM_USER}@${VM_IP}" \
            'test -f /var/lib/samba-firstboot.done' 2>/dev/null; then

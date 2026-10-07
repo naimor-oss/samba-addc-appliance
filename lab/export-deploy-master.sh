@@ -24,9 +24,8 @@
 #
 # The .vmx fed to ovftool is intentionally minimal — its only job is to give
 # ovftool a virtual machine definition to hang the disk under so the OVF
-# manifest is well-formed. Specific hardware (NIC type, vCPU count, RAM)
-# inside the .ova is set conservatively (vmxnet3, 2 vCPU, 2 GB) and end-users
-# can reshape after import.
+# manifest is well-formed. IDE + E1000 are deliberately conservative,
+# broadly-supported interchange hardware. End-users can reshape after import.
 #===============================================================================
 set -euo pipefail
 
@@ -65,6 +64,8 @@ Flags:
   -s, --snapshot NAME   snapshot to export (default: $SNAPSHOT)
   -V, --version V       version string for artifact names
                         (default: today's date Y.M.D, e.g. ${VERSION})
+      --ova-only        produce only the generic OVA + SHA256SUMS
+                        (intermediate VMDK is temporary)
       --keep-export     don't remove the host-side export tree on exit
   -h, --help            show this
 
@@ -74,12 +75,15 @@ USAGE
 }
 
 KEEP_HOST_EXPORT=0
+OVA_ONLY=0
+PACKAGE_TMP=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -n|--vm-name)    VM_NAME="$2"; shift 2 ;;
         -s|--snapshot)   SNAPSHOT="$2"; shift 2 ;;
         -V|--version)    VERSION="$2"; recompute_paths; shift 2 ;;
+        --ova-only)      OVA_ONLY=1; shift ;;
         --keep-export)   KEEP_HOST_EXPORT=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -94,10 +98,27 @@ step() { echo
 
 ssh_host() { ssh "${HV_USER}@${HV_HOST}" "$@"; }
 
+cleanup_package_tmp() {
+    [[ -n "$PACKAGE_TMP" ]] || return 0
+    rm -f "$PACKAGE_TMP/${ARTIFACT_BASE}.vmx" \
+          "$PACKAGE_TMP/${ARTIFACT_BASE}.vmdk"
+    rmdir "$PACKAGE_TMP" 2>/dev/null || true
+    PACKAGE_TMP=""
+}
+trap cleanup_package_tmp EXIT
+
 [[ -d "$ISO_DIR_MAC" ]] || { echo "ISO share not mounted: $ISO_DIR_MAC" >&2; exit 1; }
 [[ -x "$OVFTOOL"     ]] || { echo "ovftool not found at $OVFTOOL" >&2; exit 1; }
 command -v qemu-img >/dev/null || { echo "qemu-img missing (brew install qemu)" >&2; exit 1; }
 
+# Never merge a new export into an old version directory. Besides making
+# checksums ambiguous, that is how target-specific near-duplicate archives
+# accumulated in an earlier test run.
+if [[ -e "$DIST_VER_DIR" ]]; then
+    echo "artifact directory already exists: $DIST_VER_DIR" >&2
+    echo "choose a new version or move the existing directory aside" >&2
+    exit 1
+fi
 mkdir -p "$DIST_VER_DIR"
 
 step "1. Hyper-V: Export-VMSnapshot $VM_NAME / $SNAPSHOT -> $HOST_EXPORT_DIR"
@@ -132,29 +153,43 @@ EXPORTED_VHDX_MAC="${MAC_EXPORT_DIR}/${VM_NAME}/Virtual Hard Disks/merged.vhdx"
 say "merged vhdx at $EXPORTED_VHDX_MAC"
 [[ -f "$EXPORTED_VHDX_MAC" ]] || { say "merged.vhdx not visible via SMB"; exit 1; }
 
-VHDX_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vhdx"
-QCOW2_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.qcow2"
-VMDK_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vmdk"
 OVA_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.ova"
-VMX_TMP="$DIST_VER_DIR/${ARTIFACT_BASE}.vmx"
+if [[ $OVA_ONLY -eq 1 ]]; then
+    PACKAGE_TMP=$(mktemp -d -t samba-ova-package.XXXXXX)
+    VHDX_OUT="$EXPORTED_VHDX_MAC"
+    VMDK_OUT="$PACKAGE_TMP/${ARTIFACT_BASE}.vmdk"
+    VMX_TMP="$PACKAGE_TMP/${ARTIFACT_BASE}.vmx"
+    say "OVA-only mode: intermediate files at $PACKAGE_TMP"
+else
+    VHDX_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vhdx"
+    QCOW2_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.qcow2"
+    VMDK_OUT="$DIST_VER_DIR/${ARTIFACT_BASE}.vmdk"
+    VMX_TMP="$DIST_VER_DIR/${ARTIFACT_BASE}.vmx"
 
-step "2. copy merged.vhdx out of the host export into dist/"
-cp "$EXPORTED_VHDX_MAC" "$VHDX_OUT"
-say "wrote $VHDX_OUT ($(du -sh "$VHDX_OUT" | cut -f1))"
+    step "2. copy merged.vhdx out of the host export into dist/"
+    cp "$EXPORTED_VHDX_MAC" "$VHDX_OUT"
+    say "wrote $VHDX_OUT ($(du -sh "$VHDX_OUT" | cut -f1))"
 
-step "3. qemu-img convert vhdx -> qcow2"
-qemu-img convert -p -O qcow2 -o compat=1.1 "$VHDX_OUT" "$QCOW2_OUT"
-say "wrote $QCOW2_OUT ($(du -sh "$QCOW2_OUT" | cut -f1))"
+    step "3. qemu-img convert vhdx -> qcow2"
+    VHDX_SOURCE_OPTS="driver=vhdx,file.driver=file,file.filename=${VHDX_OUT},file.locking=off"
+    qemu-img convert --image-opts -U -p -O qcow2 -o compat=1.1 \
+        "$VHDX_SOURCE_OPTS" "$QCOW2_OUT"
+    say "wrote $QCOW2_OUT ($(du -sh "$QCOW2_OUT" | cut -f1))"
+fi
 
 step "4. qemu-img convert vhdx -> vmdk (streamOptimized for OVA)"
-qemu-img convert -p -O vmdk -o subformat=streamOptimized "$VHDX_OUT" "$VMDK_OUT"
+# The exported VHDX is immutable. Explicitly disable file-node locking because
+# macOS SMB mounts do not implement the byte-range lock QEMU otherwise requests.
+VHDX_SOURCE_OPTS="driver=vhdx,file.driver=file,file.filename=${VHDX_OUT},file.locking=off"
+qemu-img convert --image-opts -U -p -O vmdk -o subformat=streamOptimized \
+    "$VHDX_SOURCE_OPTS" "$VMDK_OUT"
 say "wrote $VMDK_OUT ($(du -sh "$VMDK_OUT" | cut -f1))"
 
 step "5. write a minimal .vmx for ovftool"
 # guestOS=debian12-64 is the closest GOS identifier widely recognized by
-# VMware (Debian 13 may not be in older host databases). firmware=efi
-# matches the cloud-image bootloader; Secure Boot off because the cloud
-# image is signed with the Debian key, not Microsoft's UEFI CA.
+# OVF consumers (Debian 13 may not be in older databases). firmware=efi
+# matches the cloud-image bootloader; Secure Boot is disabled because the
+# cloud image is signed with the Debian key, not Microsoft's UEFI CA.
 cat > "$VMX_TMP" <<VMXEOF
 .encoding = "UTF-8"
 config.version = "8"
@@ -166,13 +201,11 @@ firmware = "efi"
 uefi.secureBoot.enabled = "FALSE"
 memSize = "2048"
 numvcpus = "2"
-scsi0.present = "TRUE"
-scsi0.virtualDev = "pvscsi"
-scsi0:0.present = "TRUE"
-scsi0:0.deviceType = "disk"
-scsi0:0.fileName = "$(basename "$VMDK_OUT")"
+ide0:0.present = "TRUE"
+ide0:0.deviceType = "disk"
+ide0:0.fileName = "$(basename "$VMDK_OUT")"
 ethernet0.present = "TRUE"
-ethernet0.virtualDev = "vmxnet3"
+ethernet0.virtualDev = "e1000"
 ethernet0.connectionType = "nat"
 ethernet0.startConnected = "TRUE"
 ethernet0.addressType = "generated"
@@ -185,15 +218,25 @@ step "6. ovftool .vmx -> .ova"
 say "wrote $OVA_OUT ($(du -sh "$OVA_OUT" | cut -f1))"
 
 step "7. SHA256SUMS"
-(cd "$DIST_VER_DIR" && shasum -a 256 \
-    "${ARTIFACT_BASE}.vhdx" \
-    "${ARTIFACT_BASE}.qcow2" \
-    "${ARTIFACT_BASE}.vmdk" \
-    "${ARTIFACT_BASE}.ova" \
-    > SHA256SUMS && cat SHA256SUMS)
+if [[ $OVA_ONLY -eq 1 ]]; then
+    (cd "$DIST_VER_DIR" && shasum -a 256 \
+        "${ARTIFACT_BASE}.ova" \
+        > SHA256SUMS && cat SHA256SUMS)
+else
+    (cd "$DIST_VER_DIR" && shasum -a 256 \
+        "${ARTIFACT_BASE}.vhdx" \
+        "${ARTIFACT_BASE}.qcow2" \
+        "${ARTIFACT_BASE}.vmdk" \
+        "${ARTIFACT_BASE}.ova" \
+        > SHA256SUMS && cat SHA256SUMS)
+fi
 
 step "8. cleanup"
-rm -f "$VMX_TMP"
+if [[ -n "$PACKAGE_TMP" ]]; then
+    cleanup_package_tmp
+else
+    rm -f "$VMX_TMP"
+fi
 if [[ $KEEP_HOST_EXPORT -eq 0 ]]; then
     say "removing host-side export at $HOST_EXPORT_DIR"
     ssh_host "Remove-Item -LiteralPath '$HOST_EXPORT_DIR' -Recurse -Force -ErrorAction SilentlyContinue"

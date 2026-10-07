@@ -108,8 +108,12 @@ $inside = {
         ForEach-Object {
             Note 'DNS-A' "$($_.HostName).$domainDns -> $($_.RecordData.IPv4Address)" 'remove'
             if (-not $DryRun) {
-                Remove-DnsServerResourceRecord -ZoneName $domainDns -InputObject $_ `
-                    -Force -ErrorAction SilentlyContinue
+                try {
+                    Remove-DnsServerResourceRecord -ZoneName $domainDns -InputObject $_ `
+                        -Force -ErrorAction Stop
+                } catch {
+                    Note 'DNS-A' $_.Exception.Message 'warn'
+                }
             }
         }
 
@@ -126,8 +130,12 @@ $inside = {
             ForEach-Object {
                 Note 'DNS-SRV' "$($_.HostName) in $zone -> $($_.RecordData.DomainName)" 'remove'
                 if (-not $DryRun) {
-                    Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $_ `
-                        -Force -ErrorAction SilentlyContinue
+                    try {
+                        Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $_ `
+                            -Force -ErrorAction Stop
+                    } catch {
+                        Note 'DNS-SRV' $_.Exception.Message 'warn'
+                    }
                 }
             }
     }
@@ -145,8 +153,12 @@ $inside = {
                 ForEach-Object {
                     Note 'DNS-PTR' "$($_.HostName).$zone -> $($_.RecordData.PtrDomainName)" 'remove'
                     if (-not $DryRun) {
-                        Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $_ `
-                            -Force -ErrorAction SilentlyContinue
+                        try {
+                            Remove-DnsServerResourceRecord -ZoneName $zone -InputObject $_ `
+                                -Force -ErrorAction Stop
+                        } catch {
+                            Note 'DNS-PTR' $_.Exception.Message 'warn'
+                        }
                     }
                 }
         }

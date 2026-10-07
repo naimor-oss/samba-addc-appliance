@@ -78,6 +78,13 @@ run_scenario() {
         SC_ROLE='$SC_ROLE' \
         samba-sconfig join-dc"
 
+    # A normal DC join must immediately protect existing domain namespace
+    # roots. This runs before the optional tertiary-server setup below, so the
+    # two mechanisms cannot accidentally mask one another.
+    step "verify automatic root proxy created by the join"
+    ssh_vm "sudo testparm -s --section-name='${SC_DFS_NAMESPACE}' \
+        --parameter-name='msdfs proxy' 2>/dev/null"
+
     # The join replicates the domain NC, which contains the DFS-N
     # configuration objects (CN=Dfs-Configuration,CN=System,...). They're
     # almost always present immediately after a successful join; if not,
@@ -153,6 +160,20 @@ run_scenario() {
 verify() {
     local rc=0 out
     local ns_dir="${SC_DFS_ROOT}/${SC_DFS_NAMESPACE}"
+
+    say "automatic root proxy is parsed and enabled before tertiary DFS setup"
+    out=$(ssh_vm "sudo testparm -s --section-name='${SC_DFS_NAMESPACE}' \
+        --parameter-name='msdfs proxy' 2>/dev/null" || true)
+    echo "  msdfs proxy: $out"
+    [[ -n "$out" ]] || { say "automatic root proxy missing for ${SC_DFS_NAMESPACE}"; rc=1; }
+
+    say "Windows reaches the namespace directly through Samba and by domain path"
+    out=$(ssh_host "pwsh -File ${LAB_HOST_STAGE_DIR}\\Verify-DfsRootProxy.ps1 \
+        -SambaServer '${LAB_VM_NAME}.${SC_REALM}' \
+        -Realm '$SC_REALM' -NamespaceName '$SC_DFS_NAMESPACE'" || true)
+    echo "$out"
+    grep -q '^PASS: Samba direct proxy and domain DFS path are both accessible\.$' <<< "$out" \
+        || { say "Windows DFS root proxy verification failed"; rc=1; }
 
     say "dfs-update produces no shell-runtime errors on stderr"
     # Regression guard: under set -u or pipe-eating misuse, samba-sconfig

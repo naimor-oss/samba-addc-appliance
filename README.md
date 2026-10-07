@@ -13,16 +13,17 @@ provision or join a domain.
 | **Deploy** the appliance from a release artifact (`.ova` / `.qcow2` / `.vhdx`) on your hypervisor | [`docs/RELEASE.md`](docs/RELEASE.md) — import recipes per hypervisor, first-boot wizard, day-one configuration |
 | **Build your own master** image, run the test lab, or contribute changes | [`docs/SETUP.md`](docs/SETUP.md) — Mac tools, Hyper-V host, external artifacts, sibling-repo checkout, and the "First-Time Lab Setup" walkthrough below |
 | Understand the **test methodology** | [`docs/LAB-TESTING.md`](docs/LAB-TESTING.md) — scenario runner, existing scenarios, planned coverage |
-| Understand the **sibling-repo split** | [`../dev-commons/REPO-SPLIT.md`](../dev-commons/REPO-SPLIT.md) — boundaries between this repo and `dev-commons`, `lab-kit`, `lab-router`, `smb-proxy-appliance` |
+| Understand the **sibling-repo split** | [`../dev-commons/REPO-SPLIT.md`](../dev-commons/REPO-SPLIT.md) — boundaries among all six repositories |
 | Look up **shared coding/docs/test conventions** | [`../dev-commons/STYLE.md`](../dev-commons/STYLE.md) |
 
 The appliance is exercised against a Windows Server 2025 forest with
-Microsoft security baseline GPOs applied. The lab is built from five
+Microsoft security baseline GPOs applied. The lab is built from six
 sibling repositories living next to each other on disk:
 
 - [`dev-commons`](../dev-commons/) — cross-cutting docs, templates, tooling
 - [`lab-kit`](../lab-kit/) — reusable appliance lab orchestration
 - [`lab-router`](../lab-router/) — simple reusable lab router VM
+- [`appliance-core`](../appliance-core/) — shared runtime libraries vendored during image preparation
 - `samba-addc-appliance` — this Samba appliance and its scenarios
 - [`smb-proxy-appliance`](../smb-proxy-appliance/) — SMB1↔SMB3 proxy appliance (joins this lab as a member server)
 
@@ -285,11 +286,22 @@ caveat live in [`docs/RELEASE.md`](docs/RELEASE.md).
 ## Important Design Notes
 
 - Samba does not implement DFSR. SYSVOL replication is handled explicitly by
-  `sysvol-sync` and by SMB-based seeding after a Windows join.
-- DFS-N (domain-based namespaces) is supported as a tertiary fallback
-  target via `samba-sconfig dfs-*` (interactive TUI under main-menu
-  item *DFS Namespace Server*, or headless subcommands for
-  automation). The appliance reads the AD-replicated link metadata,
+  `sysvol-sync` and by SMB-based seeding after a Windows join. Whole-tree ACL
+  resets run through `samba-sysvol-acl-reset.service`, so a large domain can
+  take as long as needed without depending on the initiating SSH connection.
+  The foreground client prints elapsed heartbeats; a replacement session can
+  inspect `samba-sconfig sysvol-acl-status` and
+  `/var/log/samba/sysvol-acl-reset.log`. A failed reset makes the join report a
+  partial failure instead of being silently ignored.
+- Existing domain-based DFS namespace roots are protected automatically
+  during provision or join. The DC reads replicated root-target metadata,
+  creates managed `msdfs proxy` shares, excludes itself to prevent referral
+  loops, and converges every five minutes. A failed or conflicting update
+  retains the last known-good configuration and makes the join report a
+  partial failure; operators can retry with `samba-sconfig dfs-root-sync`.
+- Separately, DFS-N can be configured as a tertiary fallback namespace
+  target via the interactive *DFS Namespace Server* menu or the remaining
+  `samba-sconfig dfs-*` commands. The appliance reads replicated link metadata,
   parses the UTF-16LE-XML `msDFS-TargetListv2` blobs, and atomically
   materializes MSDFS symlinks under a hosted namespace share. Tertiary
   status is set on the Windows side (`New-DfsnRootTarget` to register,

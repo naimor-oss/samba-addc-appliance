@@ -88,6 +88,16 @@ verify() {
         rc=1
     fi
 
+    say "durable SYSVOL NTACL reset completed successfully"
+    out=$(ssh_vm 'sudo samba-sconfig sysvol-acl-status' 2>&1 || true)
+    echo "$out"
+    if ! grep -q 'State: inactive (dead)' <<< "$out" \
+       || ! grep -q 'Result: success' <<< "$out" \
+       || ! grep -q 'SYSVOL NTACL reset completed' <<< "$out"; then
+        say "SYSVOL NTACL reset service did not report clean completion"
+        rc=1
+    fi
+
     say "TLS cert has SAN"
     ssh_vm 'sudo openssl x509 -noout -ext subjectAltName -in /var/lib/samba/private/tls/cert.pem 2>&1 | head -5' || rc=1
 

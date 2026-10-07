@@ -89,7 +89,6 @@ REMOVE_PKGS=(
     debconf-i18n
 
     # Real-hardware bits that never apply to a VM DC.
-    eject
     discover discover-data
     # Wireless — VMs don't have radios. The regulatory DB alone is ~1 MB.
     wpasupplicant wireless-regdb crda iw
@@ -98,6 +97,15 @@ REMOVE_PKGS=(
     # Audio
     alsa-utils pulseaudio
 )
+
+# cloud-init depends on eject, so removing eject in the initial pass would also
+# remove the command needed to erase the build seed. Purge both afterward.
+DEFERRED_REMOVE_PKGS=(cloud-init eject)
+for pkg in "${DEFERRED_REMOVE_PKGS[@]}"; do
+    if dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+        apt-mark manual "$pkg" >/dev/null
+    fi
+done
 
 for pkg in "${REMOVE_PKGS[@]}"; do
     if dpkg -l "$pkg" &>/dev/null 2>&1; then
@@ -211,7 +219,7 @@ du -sh "$VMTOOLS_CACHE"/* 2>/dev/null | sed 's|^|    |'
 #===============================================================================
 log "Updating package index and upgrading system..."
 apt-get update -y
-apt-get upgrade -y
+apt-get full-upgrade -y
 
 #===============================================================================
 # 4. BASE TOOLS (replaces manual post-install steps)
@@ -230,6 +238,7 @@ apt-get install -y \
     rsync \
     bash-completion \
     locales-all \
+    dialog \
     whiptail \
     nftables \
     ldap-utils
@@ -289,11 +298,16 @@ PWSH_INSTALLED=false
 # build and avoids leaving a half-configured Microsoft source behind.
 rm -f /etc/apt/sources.list.d/microsoft.list /usr/share/keyrings/microsoft-archive-keyring.gpg
 
-PWSH_VER="7.6.0"
+PWSH_VER="7.6.4"
 PWSH_DEB="powershell_${PWSH_VER}-1.deb_amd64.deb"
+PWSH_SHA256="E5688E0569568D48051C49D3E93504CDE47AF709CDAAABD9A8892BC676B3BDF3"
 if wget -q "https://github.com/PowerShell/PowerShell/releases/download/v${PWSH_VER}/${PWSH_DEB}" -O "/tmp/${PWSH_DEB}"; then
-    dpkg -i "/tmp/${PWSH_DEB}" 2>/dev/null || true
-    apt-get install -f -y
+    if printf '%s  %s\n' "$PWSH_SHA256" "/tmp/${PWSH_DEB}" | sha256sum -c -; then
+        dpkg -i "/tmp/${PWSH_DEB}" 2>/dev/null || true
+        apt-get install -f -y
+    else
+        warn "PowerShell package checksum verification failed"
+    fi
     rm -f "/tmp/${PWSH_DEB}"
     if command -v pwsh &>/dev/null; then
         PWSH_INSTALLED=true
@@ -401,6 +415,17 @@ makestep 1.0 3
 #allow 192.168.0.0/16   # enabled by samba-sconfig after provision/join
 CHRONEOF
 
+# Request RFC 4833 option 101 without enabling networkd's UseTimezone.
+# The latter would apply an untrusted DHCP value automatically; samba-init
+# and samba-sconfig instead validate the lease value and offer it as a
+# visible, operator-confirmed suggestion.
+log "Enabling DHCP timezone suggestions..."
+install -d -m 0755 /etc/systemd/network/10-netplan-primary.network.d
+cat > /etc/systemd/network/10-netplan-primary.network.d/10-timezone-request.conf << 'TZREQUESTEOF'
+[DHCPv4]
+RequestOptions=101
+TZREQUESTEOF
+
 #===============================================================================
 # 16. BACKUP NSSWITCH.CONF
 #===============================================================================
@@ -429,6 +454,11 @@ for src in /root/samba-sconfig.sh /root/samba-sconfig; do
     fi
 done
 [[ -x /usr/local/sbin/samba-sconfig ]] || warn "samba-sconfig not found — copy it manually to /usr/local/sbin/"
+
+if [[ -x /usr/local/sbin/samba-sconfig ]]; then
+    log "Installing durable SYSVOL NTACL reset service..."
+    /usr/local/sbin/samba-sconfig sysvol-acl-install
+fi
 
 grep -q 'samba-sconfig' /root/.bashrc 2>/dev/null || \
     echo 'alias sconfig="sudo samba-sconfig"' >> /root/.bashrc
@@ -476,12 +506,17 @@ if [[ -n "$LIB_SRC" ]]; then
 
     PROV_FILE=/etc/appliance-core.provenance
     PROV_COMMIT="${APPCORE_BUILD_COMMIT:-unknown}"
+    PROV_CONSUMER_COMMIT="${SAMBA_BUILD_COMMIT:-unknown}"
+    PROV_TREE_STATE="${SOURCE_TREE_STATE:-unknown}"
     {
         printf 'appliance-core-version=%s\n' "$(<"$LIB_TARGET/VERSION")"
         printf 'appliance-core-commit=%s\n'  "$PROV_COMMIT"
+        printf 'appliance-core-tree-state=%s\n' "$PROV_TREE_STATE"
         printf 'image-built-at=%s\n'         "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         printf 'image-built-on=%s\n'         "$(uname -srm)"
         printf 'consumer=samba-addc-appliance\n'
+        printf 'consumer-commit=%s\n'         "$PROV_CONSUMER_COMMIT"
+        printf 'consumer-tree-state=%s\n'     "$PROV_TREE_STATE"
     } > "$PROV_FILE"
     chmod 0644 "$PROV_FILE"
     log "  provenance: $(tr '\n' ' ' < "$PROV_FILE")"
@@ -492,19 +527,10 @@ else
 fi
 
 #===============================================================================
-# 19. MOTD BANNER
+# 19. STATIC MOTD
 #===============================================================================
-log "Setting login banner..."
-cat > /etc/motd << 'MOTDEOF'
-
-  ╔═══════════════════════════════════════════════════════╗
-  ║        Samba Active Directory Domain Controller       ║
-  ║                  Debian 13 (Trixie)                   ║
-  ╠═══════════════════════════════════════════════════════╣
-  ║  Run 'sudo samba-sconfig' to configure this server.   ║
-  ╚═══════════════════════════════════════════════════════╝
-
-MOTDEOF
+log "Clearing static MOTD; update-motd.d provides the login status..."
+: > /etc/motd
 
 #===============================================================================
 # 20. NFTABLES FIREWALL RULESET (inactive)
@@ -625,8 +651,8 @@ cat > /usr/local/sbin/sysvol-sync << 'SYNCEOF'
 #      (settled, no DFSR mid-flight). The first peer that answers yes is
 #      used as the source.
 #   5. The chosen GPO is pulled into a staging tmpdir and rsync'd into place
-#      atomically per-GPO, then `samba-tool ntacl sysvolreset` is run once at
-#      the end if any GPO actually changed.
+#      atomically per-GPO, then the durable SYSVOL NTACL reset service runs
+#      once at the end if any GPO actually changed.
 #
 # Authentication uses smbclient -P (Privileged), which makes Samba's own
 # tooling pick up this DC's machine credentials directly from
@@ -676,6 +702,10 @@ EXCLUDE_DCS="${EXCLUDE_DCS:-}"
 if [[ "$MODE" == "sync" ]]; then
     exec 200>"$LOCKFILE"
     flock -n 200 || { say "skip: another sysvol-sync is already running"; exit 0; }
+    if systemctl is-active --quiet samba-sysvol-acl-reset.service; then
+        say "skip: SYSVOL NTACL reset is already running"
+        exit 0
+    fi
 fi
 
 # --- environment from smb.conf -------------------------------------------------
@@ -988,12 +1018,22 @@ for guid in "${!target_versions[@]}"; do
     rm -rf "$stage"
 done
 
-# A single whole-tree sysvolreset at the end is cheaper than per-GPO walks
-# and matches what samba-tool exposes (no per-path scope).
+# A single whole-tree reset at the end is cheaper than per-GPO walks and
+# matches what samba-tool exposes (no per-path scope). The systemd unit also
+# serializes resets and lets one finish if the cron client is interrupted.
 if [[ $any_pulled -eq 1 ]]; then
-    say "running ntacl sysvolreset"
-    samba-tool ntacl sysvolreset >>"$LOGFILE" 2>&1 \
-        || say "WARN: ntacl sysvolreset failed"
+    say "starting durable SYSVOL NTACL reset"
+    # The reset service takes this same lock. Release it before waiting for
+    # systemd, otherwise the puller would wait on a service that is waiting on
+    # the puller. A manual reset started during this sync waits here instead of
+    # rewriting ACLs while files are still being replaced.
+    flock -u 200
+    if systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1; then
+        say "SYSVOL NTACL reset completed"
+    else
+        say "ERROR: SYSVOL NTACL reset failed; see /var/log/samba/sysvol-acl-reset.log"
+        exit 1
+    fi
 fi
 
 say "done: new=$new_count updated=$update_count deleted=$delete_count current=$skip_count no-source=$no_source_count"
@@ -1151,6 +1191,12 @@ cat > /usr/local/sbin/samba-firstboot <<'FBEOF'
 set -u -o pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
+
+APPCORE_LIBS=/usr/local/lib/appliance-core
+if [[ -f "$APPCORE_LIBS/detect-net.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "$APPCORE_LIBS/detect-net.sh"
+fi
 
 LOGFILE="/var/log/samba-firstboot.log"
 MARKER="/var/lib/samba-firstboot.done"
@@ -1360,6 +1406,22 @@ printf '%s\n' "$RECS" | tee -a "$LOGFILE"
 log ""
 log "checking image freshness (apt-get update + upgradable count)..."
 APT_FRESHNESS=""
+apt_update_with_lock_retry() {
+    local attempt
+    for attempt in $(seq 1 12); do
+        if apt-get update -qq >>"$LOGFILE" 2>&1; then
+            return 0
+        fi
+        if tail -n 6 "$LOGFILE" \
+            | grep -qE 'Could not get lock|Unable to lock'; then
+            log "  apt lock busy; retrying freshness check (${attempt}/12)"
+            sleep 5
+        else
+            return 1
+        fi
+    done
+    return 1
+}
 # Wait up to 20s for default route to settle (netplan/dhcp may still be
 # negotiating right after the agent install above).
 for _ in $(seq 1 10); do
@@ -1368,7 +1430,7 @@ for _ in $(seq 1 10); do
 done
 if [[ -z "$(ip route show default 2>/dev/null)" ]]; then
     APT_FRESHNESS="apt: offline (no default route) — freshness check skipped"
-elif apt-get update -qq >>"$LOGFILE" 2>&1; then
+elif apt_update_with_lock_retry; then
     # Use --simulate to count what apt would ACTUALLY install. Plain
     # `apt list --upgradable` includes phased-rollout packages (apt 2.x
     # feature: held back per-machine until the rollout completes), and
@@ -1409,72 +1471,37 @@ log "detecting network-environment hints..."
 DETECT_FILE=/var/lib/samba-init-detected.env
 mkdir -p /var/lib
 
-# Our IPv4 (first global-scope address).
-det_ip=$(ip -o -4 addr show scope global 2>/dev/null \
-            | awk 'NR==1 {sub(/\/.*$/,"",$4); print $4}')
-# Default gateway.
-det_gateway=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-# DHCP-supplied DNS servers (resolvectl knows what came per-link).
-det_dhcp_dns=$(resolvectl dns 2>/dev/null \
-                | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) printf "%s ", $i}' \
-                | sed 's/ *$//')
-# DHCP-supplied search/route domain.
-det_dhcp_domain=$(resolvectl domain 2>/dev/null \
-                | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) {
-                                          gsub(/^~/,"",$i)
-                                          if ($i!="" && $i!=".") {print $i; exit}
-                                      }}')
-# Reverse DNS for our IP. If the network answered with a PTR, split it
-# into short-name (for the wizard's set-hostname step, which wants a
-# NetBIOS short name) and domain part (used as a secondary signal for
-# the realm when DHCP didn't supply one).
-det_ptr_fqdn="" det_ptr_name="" det_ptr_domain=""
-if [[ -n "$det_ip" ]]; then
-    det_ptr_fqdn=$(timeout 5 dig +short -x "$det_ip" 2>/dev/null \
-                    | awk 'NR==1 {sub(/\.$/,""); print}')
-    if [[ -n "$det_ptr_fqdn" ]]; then
-        det_ptr_name="${det_ptr_fqdn%%.*}"
-        if [[ "$det_ptr_fqdn" == *.* ]]; then
-            det_ptr_domain="${det_ptr_fqdn#*.}"
-        fi
-    fi
+# appliance-core owns all generic network probes, cache freshness, and
+# effective-domain source attribution.
+if ! command -v appcore_detect_net_init >/dev/null 2>&1; then
+    log "ERROR: appliance-core detect-net.sh is unavailable"
+    exit 1
 fi
-# AD-DC discovery: try the DHCP-supplied domain first, fall back to the
-# PTR-derived domain. Either gives us _ldap._tcp.<domain> SRV; the realm
-# that answered is captured for the wizard's provision/join defaults.
-det_ad_dc="" det_ad_realm=""
-for d in "$det_dhcp_domain" "$det_ptr_domain"; do
+appcore_detect_net_init
+appcore_detect_net_write_cache "$DETECT_FILE"
+
+# Samba's only extension is AD-DC discovery for the canonical domain
+# candidates. Persist it alongside the generic context.
+samba_det_ad_dc="" samba_det_ad_realm=""
+for d in "$APPCORE_DET_DHCP_DOMAIN" "$APPCORE_DET_PTR_DOMAIN"; do
     [[ -z "$d" ]] && continue
-    det_ad_dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${d}" 2>/dev/null \
+    samba_det_ad_dc=$(timeout 5 dig +short -t SRV "_ldap._tcp.${d}" 2>/dev/null \
                  | awk 'NR==1 {sub(/\.$/,"",$4); print $4}')
-    if [[ -n "$det_ad_dc" ]]; then
-        det_ad_realm="$d"
+    if [[ -n "$samba_det_ad_dc" ]]; then
+        samba_det_ad_realm="$d"
         break
     fi
 done
-# Whichever source has a value, it's the most likely realm to default
-# provision-new / join-dc against. DHCP wins when both are present.
-det_effective_domain="${det_dhcp_domain:-$det_ptr_domain}"
 
-cat > "$DETECT_FILE" <<DETEOF
-# Generated by samba-firstboot $(date -u +%Y-%m-%dT%H:%M:%SZ).
-# Refreshed on each firstboot run; samba-init reads this on every menu render.
-DET_IP="${det_ip:-}"
-DET_GATEWAY="${det_gateway:-}"
-DET_DHCP_DNS="${det_dhcp_dns:-}"
-DET_DHCP_DOMAIN="${det_dhcp_domain:-}"
-DET_PTR_FQDN="${det_ptr_fqdn:-}"
-DET_PTR_NAME="${det_ptr_name:-}"
-DET_PTR_DOMAIN="${det_ptr_domain:-}"
-DET_EFFECTIVE_DOMAIN="${det_effective_domain:-}"
-DET_AD_DC="${det_ad_dc:-}"
-DET_AD_REALM="${det_ad_realm:-}"
+cat >> "$DETECT_FILE" <<DETEOF
+SAMBA_DET_AD_DC="${samba_det_ad_dc:-}"
+SAMBA_DET_AD_REALM="${samba_det_ad_realm:-}"
 DETEOF
 chmod 644 "$DETECT_FILE"
-log "  IP: ${det_ip:-?}  gateway: ${det_gateway:-?}"
-log "  DHCP-DNS: ${det_dhcp_dns:-(none)}  DHCP-domain: ${det_dhcp_domain:-(none)}"
-log "  PTR: ${det_ptr_fqdn:-(none)}  -> short=${det_ptr_name:-?}  domain=${det_ptr_domain:-(none)}"
-log "  effective realm: ${det_effective_domain:-(none)}  AD-DC: ${det_ad_dc:-(none)} (in ${det_ad_realm:-?})"
+log "  IP: ${APPCORE_DET_IP:-?}  gateway: ${APPCORE_DET_GATEWAY:-?}"
+log "  DHCP-DNS: ${APPCORE_DET_DHCP_DNS:-(none)}  DHCP-domain: ${APPCORE_DET_DHCP_DOMAIN:-(none)}"
+log "  PTR: ${APPCORE_DET_PTR_FQDN:-(none)}  -> short=${APPCORE_DET_PTR_NAME:-?}  domain=${APPCORE_DET_PTR_DOMAIN:-(none)}"
+log "  effective realm: ${APPCORE_DET_EFFECTIVE_DOMAIN:-(none)} (${APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE:-no source})  AD-DC: ${samba_det_ad_dc:-(none)} (in ${samba_det_ad_realm:-?})"
 
 # Write the motd snippet — visible at every SSH login until removed.
 {
@@ -1576,7 +1603,7 @@ set -u
 # absent (older images that predate the vendoring).
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    for _lib in apt-helpers detect-net identity tui hostname netconfig; do
+    for _lib in apt-helpers detect-net identity tui hostname netconfig timezone; do
         [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
     done
     unset _lib
@@ -1611,56 +1638,27 @@ load_detect_env() {
     DET_IP="" DET_GATEWAY="" DET_DHCP_DNS="" DET_DHCP_DOMAIN=""
     DET_PTR_FQDN="" DET_PTR_NAME="" DET_PTR_DOMAIN=""
     DET_EFFECTIVE_DOMAIN="" DET_AD_DC="" DET_AD_REALM=""
+    SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""
     if [[ -f "$DETECT_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$DETECT_FILE"
     fi
-    # Live refresh — file values are stale once netplan changes apply.
-    DET_IP=$(ip -o -4 addr show scope global 2>/dev/null \
-                | awk 'NR==1 {sub(/\/.*$/,"",$4); print $4}')
-    DET_GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-
-    # Live PTR refresh. samba-firstboot writes the cached file exactly
-    # once (its unit has ConditionPathExists=!/var/lib/samba-firstboot.done),
-    # so the cached PTR represents what DNS said the moment the appliance
-    # first booted with its default hostname. After the operator changes
-    # the hostname (or moves the VM to a different network), the cache
-    # goes stale and stays stuck on whatever the original PTR was —
-    # commonly the build-time `samba-dc1`. A 5s-bounded reverse lookup
-    # against the current IP keeps the wizard's "Detected PTR" hint and
-    # the hostname-prompt prefill in sync with reality.
-    #
-    # Empty live result keeps the cache (transient DNS flake or air-gapped
-    # network shouldn't blank the only signal we have). Non-empty live
-    # result wins outright — the operator changed something and wants to
-    # see it.
-    if [[ -n "$DET_IP" ]]; then
-        local live_ptr
-        live_ptr=$(timeout 5 dig +short -x "$DET_IP" 2>/dev/null \
-                    | awk 'NR==1 {sub(/\.$/,""); print}')
-        if [[ -n "$live_ptr" ]]; then
-            DET_PTR_FQDN="$live_ptr"
-            DET_PTR_NAME="${live_ptr%%.*}"
-            if [[ "$live_ptr" == *.* ]]; then
-                DET_PTR_DOMAIN="${live_ptr#*.}"
-            else
-                DET_PTR_DOMAIN=""
-            fi
-        fi
+    if command -v appcore_detect_net_init >/dev/null 2>&1; then
+        appcore_detect_net_init "$DETECT_FILE" >/dev/null 2>&1 || true
+        DET_IP="${APPCORE_DET_IP:-}"
+        DET_GATEWAY="${APPCORE_DET_GATEWAY:-}"
+        DET_DHCP_DNS="${APPCORE_DET_DHCP_DNS:-}"
+        DET_DHCP_DOMAIN="${APPCORE_DET_DHCP_DOMAIN:-}"
+        DET_PTR_FQDN="${APPCORE_DET_PTR_FQDN:-}"
+        DET_PTR_NAME="${APPCORE_DET_PTR_NAME:-}"
+        DET_PTR_DOMAIN="${APPCORE_DET_PTR_DOMAIN:-}"
+        DET_EFFECTIVE_DOMAIN="${APPCORE_DET_EFFECTIVE_DOMAIN:-}"
     fi
-
-    # DHCP search-domain is also live-derivable from resolvectl. Same
-    # rule: live wins when set, fall back to cache.
-    local live_dhcp_domain
-    live_dhcp_domain=$(resolvectl domain 2>/dev/null \
-                | awk '/^Link [0-9]/ {for(i=4;i<=NF;i++) {
-                                          gsub(/^~/,"",$i)
-                                          if ($i!="" && $i!=".") {print $i; exit}
-                                      }}')
-    [[ -n "$live_dhcp_domain" ]] && DET_DHCP_DOMAIN="$live_dhcp_domain"
-
-    # Recompute the effective realm from whichever signal is current.
-    DET_EFFECTIVE_DOMAIN="${DET_DHCP_DOMAIN:-$DET_PTR_DOMAIN}"
+    if [[ -n "$SAMBA_DET_AD_REALM" &&
+          "${SAMBA_DET_AD_REALM,,}" == "${DET_EFFECTIVE_DOMAIN,,}" ]]; then
+        DET_AD_DC="$SAMBA_DET_AD_DC"
+        DET_AD_REALM="$SAMBA_DET_AD_REALM"
+    fi
 }
 
 count_upgrades() {
@@ -1718,12 +1716,14 @@ config_network() {
     # writes proper netplan, applies, and shows the result via the
     # sized-textbox renderer (no clipping on long output).
     if command -v appcore_netconfig_change_tui_single_nic >/dev/null 2>&1; then
+        load_detect_env
         sudo bash -c '
             source /usr/local/lib/appliance-core/netconfig.sh
             appcore_netconfig_change_tui_single_nic \
                 /etc/netplan/60-samba-init.yaml \
-                "e*"
-        '
+                "e*" \
+                "$1"
+        ' bash "$DET_DHCP_DNS"
         return
     fi
     # Fallback for older images without the lib.
@@ -1747,20 +1747,113 @@ change_password() {
     fi
 }
 
+ssh_key_console_hint() {
+    local virt
+    virt=$(systemd-detect-virt 2>/dev/null || true)
+    case "$virt" in
+        qemu|kvm)
+            printf '%s' \
+                "Web noVNC console (including Synology VMM): normal clipboard paste does not work in this text screen.\n\nOptional: in Chrome, install \"KVM Console Paste\" from the Chrome Web Store, allow it for this VMM site, then use it to send the key.\n\nOtherwise Cancel and choose manual entry."
+            ;;
+        *)
+            printf '%s' \
+                "Use the virtual console's clipboard control if available.\nIf paste fails, Cancel and use manual entry."
+            ;;
+    esac
+}
+
+read_pasted_ssh_key() {
+    local hint key
+    hint=$(ssh_key_console_hint)
+    key=$(whiptail --title "Paste SSH public key" --inputbox \
+        "Paste one complete public-key line into the entry field, then select OK.\n\nExpected form:\nssh-ed25519 AAAA... optional-comment\n\n${hint}" \
+        20 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return 1
+    [[ -n "$key" ]] || return 1
+    printf '%s' "$key"
+}
+
+read_typed_ed25519_key() {
+    local body="" chunk part start end error prompt
+    for part in 1 2 3 4; do
+        start=$(( (part - 1) * 17 + 1 ))
+        end=$(( part * 17 ))
+        error=""
+        while true; do
+            if [[ -n "$error" ]]; then
+                prompt="${error}\nRetry characters ${start}-${end}; no spaces or comment."
+            else
+                prompt="Type characters ${start}-${end} from the text after \"ssh-ed25519 \".\nEnter exactly 17 characters; no spaces or comment."
+            fi
+            prompt+="\nAllowed: A-Z, a-z, 0-9, +, /\nCompleted: ${#body}/68 characters"
+            chunk=$(dialog --stdout --title "Ed25519 part ${part}/4" \
+                --form "$prompt" 14 "$WT_WIDTH" 3 \
+                "12345678901234567" 1 0 \
+                "" 2 0 17 68) || return 1
+            if [[ "$chunk" =~ ^[A-Za-z0-9+/]{17}$ ]]; then
+                break
+            fi
+            if [[ ${#chunk} -ne 17 ]]; then
+                error="Error: enter exactly 17 characters."
+            else
+                error="Error: use only A-Z, a-z, 0-9, +, or /."
+            fi
+        done
+        body+="$chunk"
+    done
+    printf 'ssh-ed25519 %s' "$body"
+}
+
+confirm_ssh_public_key() {
+    local key="$1" key_info tmp
+    tmp=$(mktemp /tmp/samba-init-key.XXXXXX) || {
+        whiptail --msgbox "Could not create a temporary file; key not added." 8 "$WT_WIDTH"
+        return 1
+    }
+    printf '%s\n' "$key" > "$tmp"
+    if ! key_info=$(ssh-keygen -lf "$tmp" 2>/dev/null); then
+        rm -f "$tmp"
+        whiptail --msgbox \
+            "The completed text is not a valid SSH public key.\nCheck it against the original and try again." \
+            10 "$WT_WIDTH"
+        return 1
+    fi
+    rm -f "$tmp"
+    whiptail --title "Confirm SSH public key" --yesno \
+        "Valid key fingerprint:\n\n${key_info}\n\nAdd this key for ${SELF_USER}?" \
+        13 "$WT_WIDTH"
+}
+
 add_ssh_key() {
-    whiptail --msgbox "Paste the public key below and press OK.\n(Enter the full 'ssh-ed25519 AAA...' line.)" 10 "$WT_WIDTH"
-    local key
-    key=$(whiptail --inputbox "SSH public key:" 11 "$WT_WIDTH" 3>&1 1>&2 2>&3) || return
-    [[ -n "$key" ]] || return
+    local key method
+    method=$(whiptail --title "Add SSH public key" --menu \
+        "Choose how to enter the key." 14 "$WT_WIDTH" 3 \
+        "P" "Paste one complete public-key line" \
+        "T" "Type an Ed25519 key in four short parts" \
+        "B" "Back" \
+        3>&1 1>&2 2>&3) || return
+    case "$method" in
+        P) key=$(read_pasted_ssh_key) || return ;;
+        T) key=$(read_typed_ed25519_key) || return ;;
+        *) return ;;
+    esac
+
     case "$key" in
         ssh-rsa\ *|ssh-ed25519\ *|ecdsa-*\ *|sk-*) ;;
         *) whiptail --msgbox "That doesn't look like an SSH public key (no algorithm prefix)." 8 70; return ;;
     esac
-    local home; home=$(getent passwd "$SELF_USER" | cut -d: -f6)
+    confirm_ssh_public_key "$key" || return
+
+    local auth_file home
+    home=$(getent passwd "$SELF_USER" | cut -d: -f6)
+    auth_file="$home/.ssh/authorized_keys"
     sudo install -d -o "$SELF_USER" -g "$SELF_USER" -m 0700 "$home/.ssh"
-    if echo "$key" | sudo tee -a "$home/.ssh/authorized_keys" >/dev/null; then
-        sudo chown "$SELF_USER:$SELF_USER" "$home/.ssh/authorized_keys"
-        sudo chmod 0600 "$home/.ssh/authorized_keys"
+    if sudo test -f "$auth_file" && sudo grep -qxF -- "$key" "$auth_file"; then
+        whiptail --msgbox "That key is already authorized for ${SELF_USER}." 8 "$WT_WIDTH"
+        return
+    fi
+    if printf '%s\n' "$key" | sudo tee -a "$auth_file" >/dev/null; then
+        sudo chown "$SELF_USER:$SELF_USER" "$auth_file"
+        sudo chmod 0600 "$auth_file"
         whiptail --msgbox "Key added. SSH login as ${SELF_USER} will accept it." 9 "$WT_WIDTH"
     else
         whiptail --msgbox "Failed to write authorized_keys." 8 50
@@ -1799,25 +1892,25 @@ show_firstboot_log() {
 }
 
 set_timezone() {
-    local cur suggested prefill new
+    local cur suggested="" failure="" prefill new
     cur=$(timedatectl show --property=Timezone --value 2>/dev/null || echo Etc/UTC)
-    suggested=""
-    # Best-effort network-based hint. ipapi.co's free /timezone endpoint
-    # returns a single Region/City string. Skipped silently when offline
-    # or rate-limited; the operator just types the answer.
-    if [[ -n "$(ip route show default 2>/dev/null)" ]]; then
-        suggested=$(timeout 5 curl -fsS https://ipapi.co/timezone 2>/dev/null \
-                     | tr -d '\r\n[:space:]')
-        # Reject anything that doesn't look like a tz name (e.g. error JSON).
-        case "$suggested" in
-            */*|UTC|Etc/UTC) ;;
-            *) suggested="" ;;
-        esac
+    cur="${cur:-Etc/UTC}"
+    if command -v appcore_timezone_suggest >/dev/null 2>&1; then
+        if appcore_timezone_suggest >/dev/null; then
+            suggested="$APPCORE_TIMEZONE_SUGGESTION"
+        else
+            failure="$APPCORE_TIMEZONE_ERROR"
+        fi
+    else
+        failure="Automatic suggestion unavailable on this image."
     fi
     prefill="${suggested:-$cur}"
     local prompt="Current timezone: ${cur}"
-    [[ -n "$suggested" && "$suggested" != "$cur" ]] && \
-        prompt+="\nNetwork-based suggestion: ${suggested}"
+    if [[ -n "$suggested" ]]; then
+        prompt+="\nDetected suggestion: ${suggested}"
+    else
+        prompt+="\n${failure}"
+    fi
     prompt+="\n\nEnter Region/City. Examples:\n  America/Los_Angeles  Europe/London  Asia/Tokyo  Etc/UTC"
     new=$(whiptail --inputbox "$prompt" 14 "$WT_WIDTH" "$prefill" 3>&1 1>&2 2>&3) || return
     [[ -n "$new" ]] || return
@@ -2027,6 +2120,12 @@ action_quit() {
     exec /bin/bash --login
 }
 
+# Tests extract and source this generated script so they exercise its real
+# functions. Installed copies never set this variable.
+if [[ "${SAMBA_INIT_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Outer menu loop. Layout target: ≤24 lines on a fresh boot console so
 # nothing scrolls off the top of an 80x24 VT.
 while true; do
@@ -2111,16 +2210,16 @@ else
     dns=$(awk '/^nameserver/ {printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)
     [ -n "$dns" ] && printf '  DNS:         %s\n' "$dns"
 fi
-[ -n "$DET_PTR_FQDN" ]    && printf '  PTR for IP:  %s\n' "$DET_PTR_FQDN"
-if [ -n "$DET_EFFECTIVE_DOMAIN" ]; then
-    if [ -n "$DET_DHCP_DOMAIN" ]; then
-        printf '  Domain:      %s (via DHCP)\n' "$DET_EFFECTIVE_DOMAIN"
-    elif [ -n "$DET_PTR_DOMAIN" ]; then
-        printf '  Domain:      %s (via PTR)\n' "$DET_EFFECTIVE_DOMAIN"
+[ -n "$APPCORE_DET_PTR_FQDN" ] && printf '  PTR for IP:  %s\n' "$APPCORE_DET_PTR_FQDN"
+if [ -n "$APPCORE_DET_EFFECTIVE_DOMAIN" ]; then
+    if [ "$APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE" = "dhcp" ]; then
+        printf '  Domain:      %s (via DHCP)\n' "$APPCORE_DET_EFFECTIVE_DOMAIN"
+    elif [ "$APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE" = "ptr" ]; then
+        printf '  Domain:      %s (via PTR)\n' "$APPCORE_DET_EFFECTIVE_DOMAIN"
     fi
 fi
-if [ -n "$DET_AD_DC" ]; then
-    printf '  AD DC found: %s (existing forest at %s)\n' "$DET_AD_DC" "${DET_AD_REALM:-$DET_EFFECTIVE_DOMAIN}"
+if [ -n "$SAMBA_DET_AD_DC" ]; then
+    printf '  AD DC found: %s (existing forest at %s)\n' "$SAMBA_DET_AD_DC" "${SAMBA_DET_AD_REALM:-$APPCORE_DET_EFFECTIVE_DOMAIN}"
 fi
 printf '  Setup wizard: %s\n' "$([ -f /var/lib/samba-init.done ] && echo done || echo 'PENDING — open the console for the wizard')"
 # `systemctl is-active` already prints active/inactive/failed/unknown to
@@ -2131,9 +2230,9 @@ ad_state=$(systemctl is-active samba-ad-dc 2>/dev/null || true)
 printf '  AD DC svc:    %s\n' "${ad_state:-unavailable}"
 # One-line next-step hint based on detection + provisioning state.
 if [ ! -f /etc/samba/smb.conf ]; then
-    if [ -n "$DET_AD_DC" ]; then
+    if [ -n "$SAMBA_DET_AD_DC" ]; then
         printf '  Next step:   sudo samba-sconfig (Domain Operations -> Join existing forest)\n'
-    elif [ -n "$DET_EFFECTIVE_DOMAIN" ]; then
+    elif [ -n "$APPCORE_DET_EFFECTIVE_DOMAIN" ]; then
         printf '  Next step:   sudo samba-sconfig (Domain Operations -> Provision new forest)\n'
     else
         printf '  Next step:   sudo samba-sconfig (configure realm / join / provision)\n'
@@ -2146,6 +2245,46 @@ chmod +x /etc/update-motd.d/15-samba-net-status
 #===============================================================================
 # 25. FINAL CLEANUP
 #===============================================================================
+log "Applying final package updates..."
+apt-get update -y
+apt-get full-upgrade -y
+
+# The lab seed necessarily gives the build VM a routable FQDN. That identity
+# must not survive in the deploy master: it would otherwise become a false
+# domain-detection fallback on networks without DHCP search-domain or PTR.
+log "Generalizing build-time host identity..."
+build_fqdn=$(hostname -f 2>/dev/null || true)
+master_ip=$(ip -o -4 addr show scope global 2>/dev/null \
+    | awk 'NR==1 {sub(/\/.*$/,"",$4); print $4}')
+# shellcheck disable=SC1091
+source "$LIB_TARGET/identity.sh"
+# shellcheck disable=SC1091
+source "$LIB_TARGET/tui.sh"
+# shellcheck disable=SC1091
+source "$LIB_TARGET/detect-net.sh"
+# shellcheck disable=SC1091
+source "$LIB_TARGET/hostname.sh"
+appcore_hostname_apply_safe "samba-dc1" "" "$master_ip" || {
+    err "failed to generalize build-time hostname"
+    exit 1
+}
+if ! command -v cloud-init >/dev/null 2>&1; then
+    err "cloud-init is unavailable; cannot remove the build seed safely"
+    exit 1
+fi
+cloud-init clean --logs --seed
+apt-get purge -y "${DEFERRED_REMOVE_PKGS[@]}"
+if [[ "$build_fqdn" == *.* ]]; then
+    if grep -Fq "$build_fqdn" /etc/hostname /etc/hosts; then
+        err "build-time FQDN remains active after generalization: $build_fqdn"
+        exit 1
+    fi
+    if grep -R -Fq "$build_fqdn" /var/lib/cloud 2>/dev/null; then
+        err "build-time FQDN remains in cloud-init state: $build_fqdn"
+        exit 1
+    fi
+fi
+
 log "Final cleanup..."
 apt-get autoremove -y --purge
 apt-get clean
@@ -2167,7 +2306,7 @@ echo "  PowerShell:    $(pwsh --version 2>/dev/null || echo 'not installed')"
 echo "  Chrony:        $(chronyc --version 2>/dev/null || echo 'check manually')"
 echo "  Guest agents:  $(find /var/cache/samba-appliance/vmtools -maxdepth 1 -mindepth 1 -not -name manifest -printf '%f ' 2>/dev/null)"
 echo ""
-echo "  Removed:       ${REMOVE_PKGS[*]}"
+echo "  Removed:       ${REMOVE_PKGS[*]} ${DEFERRED_REMOVE_PKGS[*]}"
 echo ""
 echo "  Next steps:"
 echo "    1. Shut down this VM. The shutdown-state disk is the host-agnostic"
