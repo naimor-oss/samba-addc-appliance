@@ -131,6 +131,14 @@ bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 - Add tests or scenario assertions when changing behavior.
 - Use the headless `samba-sconfig` CLI for automation instead of driving the
   whiptail UI.
+- Never put a password in a command's arguments (`--password=`,
+  `--adminpass=`, `--newpassword=`, `-U user%pass`): `/proc/<pid>/cmdline`
+  is readable by every local user. Use `samba_tool_secret OPTION SECRET
+  args...` for `samba-tool` (runs its entry point in-process, secret on
+  stdin) and `run_with_auth_file` for `smbclient`/`net` (`-A` file in a
+  0700 directory under `/run`, mode 0600, removed when the command
+  returns; secrets with leading/trailing spaces are refused because
+  Samba trims them). `tests/secret-free-auth.sh` enforces this.
 
 ## Important Samba Interop Notes
 
