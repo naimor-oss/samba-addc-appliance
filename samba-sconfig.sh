@@ -45,6 +45,17 @@ if [[ -d "$APPCORE_LIBS" ]]; then
     [[ -f "$APPCORE_LIBS/netconfig.sh"  ]] && source "$APPCORE_LIBS/netconfig.sh"
     [[ -f "$APPCORE_LIBS/timezone.sh"   ]] && source "$APPCORE_LIBS/timezone.sh"
 fi
+# Persisted settings are parsed as data, never sourced (code-review session
+# plan 05). Without the parser every settings read fails closed.
+APPCORE_KVSTATE="${SAMBA_APPCORE_KVSTATE:-$APPCORE_LIBS/kvstate.sh}"
+if [[ -r "$APPCORE_KVSTATE" ]]; then
+    # shellcheck disable=SC1090
+    source "$APPCORE_KVSTATE"
+else
+    appcore_kv_load() { echo "kvstate library missing: $APPCORE_KVSTATE" >&2; return 3; }
+    appcore_kv_get() { appcore_kv_load; }
+    appcore_kv_write() { appcore_kv_load; }
+fi
 
 # info / yesno / die delegate to appliance-core's sized whiptail
 # wrappers when available. The old hand-fixed dimensions (12x64,
@@ -1566,9 +1577,12 @@ reset_admin_password() {
 #===============================================================================
 # 4. SYSVOL REPLICATION
 #===============================================================================
-SYSVOL_SYNC_CONF="/etc/samba/sysvol-sync.conf"
+SYSVOL_SYNC_CONF="${SAMBA_SYSVOL_SYNC_CONF:-/etc/samba/sysvol-sync.conf}"
 SYSVOL_SYNC_CRON="/etc/cron.d/sysvol-sync"
 SYSVOL_SYNC_OLD_CRED="/etc/samba/sysvol-sync.cred"
+readonly -a SYSVOL_SYNC_KEYS=(SYNC_INTERVAL PREFERRED_DCS EXCLUDE_DCS)
+# Space-separated host names (PREFERRED_DCS / EXCLUDE_DCS).
+readonly FQDN_LIST_RE='^([A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?( |$))*$'
 readonly SYSVOL_ACL_RESET_SERVICE="${SAMBA_SYSVOL_ACL_RESET_SERVICE:-samba-sysvol-acl-reset.service}"
 readonly SYSVOL_ACL_RESET_UNIT_FILE="${SAMBA_SYSVOL_ACL_RESET_UNIT_FILE:-/etc/systemd/system/${SYSVOL_ACL_RESET_SERVICE}}"
 readonly SYSVOL_ACL_RESET_LOG="${SAMBA_SYSVOL_ACL_RESET_LOG:-/var/log/samba/sysvol-acl-reset.log}"
@@ -1636,22 +1650,22 @@ configure_sysvol_sync() {
     excluded=$(whiptail --inputbox \
         "Optional: space-separated FQDNs that must NEVER be used as a SYSVOL source (e.g. a half-decommissioned DC). Blank = no exclusions." \
         13 72 "" 3>&1 1>&2 2>&3) || return
+    preferred=$(printf '%s' "$preferred" | tr -s ' ' | sed 's/^ //; s/ $//')
+    excluded=$(printf '%s' "$excluded" | tr -s ' ' | sed 's/^ //; s/ $//')
+    [[ "$preferred" =~ $FQDN_LIST_RE && "$excluded" =~ $FQDN_LIST_RE ]] \
+        || { info "Host lists must be space-separated host names (letters, digits, dots, dashes)."; return; }
 
     if [[ ! -f /var/lib/samba/private/secrets.tdb ]]; then
         info "DC not joined / provisioned (no secrets.tdb). Configure aborted."
         return
     fi
 
-    umask 077
-    cat > "$SYSVOL_SYNC_CONF" <<SCEOF
-# sysvol-sync.conf — v2 (multi-source, machine-credentials)
-# Managed by samba-sconfig. Hand-edits survive next configure if format is preserved.
-SYNC_INTERVAL="${interval}"
-PREFERRED_DCS="${preferred}"
-EXCLUDE_DCS="${excluded}"
-SCEOF
-    chmod 640 "$SYSVOL_SYNC_CONF"
-    umask 022
+    # sysvol-sync.conf v2 (multi-source, machine credentials), written as data.
+    if ! appcore_kv_write "$SYSVOL_SYNC_CONF" 0640 \
+            SYNC_INTERVAL "$interval" PREFERRED_DCS "$preferred" EXCLUDE_DCS "$excluded"; then
+        info "Could not write $SYSVOL_SYNC_CONF."
+        return
+    fi
 
     cat > "$SYSVOL_SYNC_CRON" <<CRON
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -1893,9 +1907,12 @@ show_sync_status() {
 ==================
 
 "
-    if [[ -f "$SYSVOL_SYNC_CONF" ]]; then
-        # shellcheck disable=SC1091
-        source "$SYSVOL_SYNC_CONF"
+    local SYNC_INTERVAL="" PREFERRED_DCS="" EXCLUDE_DCS=""
+    if [[ -f "$SYSVOL_SYNC_CONF" ]] && ! appcore_kv_load "$SYSVOL_SYNC_CONF" "${SYSVOL_SYNC_KEYS[@]}" 2>/dev/null; then
+        st+="Config $SYSVOL_SYNC_CONF is malformed; re-run Configure.
+
+"
+    elif [[ -f "$SYSVOL_SYNC_CONF" ]]; then
         st+="Interval:   ${SYNC_INTERVAL:-?} min
 Preferred:  ${PREFERRED_DCS:-<none>}
 Excluded:   ${EXCLUDE_DCS:-<none>}
@@ -2306,7 +2323,32 @@ readonly DFS_DEFAULT_SHARE="dfs_root"
 readonly DFS_INCLUDE_FILE="/etc/samba/conf.d/dfs-root.conf"
 readonly DFS_SENTINEL_NAME=".dfsn-managed"
 readonly DFS_LOCK="/run/samba-dfs-update.lock"
-readonly DFS_CONF="/etc/samba/dfs-update.conf"
+readonly DFS_CONF="${SAMBA_DFS_CONF:-/etc/samba/dfs-update.conf}"
+readonly -a DFS_KEYS=(DFS_ROOT DFS_SHARE DFS_NAMESPACES DFS_PREFER)
+
+# Load $DFS_CONF as data (code-review session plan 05) into DFS_ROOT,
+# DFS_SHARE, DFS_NAMESPACES and DFS_PREFER. Non-zero when it is missing or
+# malformed; nothing is assigned then.
+dfs_conf_load() {
+    DFS_ROOT="" DFS_SHARE="" DFS_NAMESPACES="" DFS_PREFER=""
+    [[ -f "$DFS_CONF" ]] || return 1
+    appcore_kv_load "$DFS_CONF" "${DFS_KEYS[@]}" || {
+        echo "[dfs] $DFS_CONF is malformed; re-run dfs-init and dfs-configure" >&2
+        return 3
+    }
+}
+
+# Print DFS_ROOT from $DFS_CONF, or nothing when absent or malformed.
+dfs_conf_root() {
+    [[ -f "$DFS_CONF" ]] || return 0
+    appcore_kv_get "$DFS_CONF" DFS_ROOT "${DFS_KEYS[@]}" 2>/dev/null || true
+}
+
+# Write $DFS_CONF atomically: ROOT SHARE NAMESPACES PREFER.
+dfs_conf_save() {
+    appcore_kv_write "$DFS_CONF" 0644 \
+        DFS_ROOT "$1" DFS_SHARE "$2" DFS_NAMESPACES "$3" DFS_PREFER "$4"
+}
 readonly DFS_PARSE_HELPER="/usr/local/sbin/samba-dfs-parse-targets"
 readonly DFS_UNIT="/etc/systemd/system/samba-dfs-update.service"
 readonly DFS_TIMER="/etc/systemd/system/samba-dfs-update.timer"
@@ -2602,8 +2644,7 @@ _dfs_install_units() {
         # Read DFS_ROOT in a subshell so we don't leak the var into the
         # outer scope.
         local conf_root
-        # shellcheck disable=SC1090
-        conf_root=$( source "$DFS_CONF"; printf '%s' "${DFS_ROOT:-}" )
+        conf_root=$(dfs_conf_root)
         [[ -n "$conf_root" ]] && rwroot="$conf_root"
     fi
     cat > "$DFS_UNIT" <<UNITEOF
@@ -2657,8 +2698,7 @@ _dfs_run_update() {
     local dry="${SC_DFS_DRY_RUN:-0}"
 
     [[ -f "$DFS_CONF" ]] || { echo "[dfs] no config — run dfs-init first" >&2; return 1; }
-    # shellcheck disable=SC1090
-    source "$DFS_CONF"
+    dfs_conf_load || return 1
     : "${DFS_NAMESPACES:=}"
     : "${DFS_PREFER:=}"
     : "${DFS_ROOT:=$DFS_DEFAULT_ROOT}"
@@ -2868,7 +2908,8 @@ menu_dfs() {
         local state="not configured" timer="off" ns="<none>"
         if [[ -f "$DFS_CONF" ]]; then
             state="configured"
-            ns=$(awk -F'"' '/^DFS_NAMESPACES=/ {print $2}' "$DFS_CONF" 2>/dev/null)
+            ns=$(appcore_kv_get "$DFS_CONF" DFS_NAMESPACES "${DFS_KEYS[@]}" 2>/dev/null) \
+                || { state="malformed config"; ns=""; }
             [[ -z "$ns" ]] && ns="<none>"
         fi
         systemctl is-active samba-dfs-update.timer &>/dev/null && timer="on"
@@ -2945,8 +2986,7 @@ tui_dfs_init() {
 
 tui_dfs_configure() {
     [[ -f "$DFS_CONF" ]] || { info "Run Initialize (menu 1) first."; return; }
-    # shellcheck disable=SC1090
-    source "$DFS_CONF"
+    dfs_conf_load 2>/dev/null || { info "$DFS_CONF is malformed. Run Initialize (menu 1) again."; return; }
     local ns prefer
     ns=$(whiptail --inputbox \
         "Namespaces to manage (space-separated, e.g. 'Public Internal').\nEach name: 1-80 chars, letters/digits/dot/underscore/dash.\nA trailing \$ marks the namespace as hidden in network browsing\n(e.g. Engineering\$, Public\$)." \
@@ -3077,8 +3117,7 @@ is_dfs_enabled() {
     local dfs_root="$DFS_DEFAULT_ROOT"
     if [[ -f "$DFS_CONF" ]]; then
         local conf_root
-        # shellcheck disable=SC1090
-        conf_root=$( source "$DFS_CONF"; printf '%s' "${DFS_ROOT:-}" )
+        conf_root=$(dfs_conf_root)
         [[ -n "$conf_root" ]] && dfs_root="$conf_root"
     fi
     [[ -f "${dfs_root}/${DFS_SENTINEL_NAME}" ]] || return 1
@@ -3569,21 +3608,14 @@ cli_dfs_init_inner() {
     : > "${root}/${DFS_SENTINEL_NAME}"
     chmod 0644 "${root}/${DFS_SENTINEL_NAME}"
     _dfs_write_drop_in "$root" "$share"
-    if [[ ! -f "$DFS_CONF" ]]; then
-        cat > "$DFS_CONF" <<CONFEOF
-# Managed by samba-sconfig dfs-* commands.
-DFS_ROOT="${root}"
-DFS_SHARE="${share}"
-DFS_NAMESPACES=""
-DFS_PREFER=""
-CONFEOF
-        chmod 0644 "$DFS_CONF"
-    else
-        sed -i \
-            -e "s|^DFS_ROOT=.*|DFS_ROOT=\"${root}\"|" \
-            -e "s|^DFS_SHARE=.*|DFS_SHARE=\"${share}\"|" \
-            "$DFS_CONF"
+    # Keep configured namespaces across a re-init; a malformed file is
+    # replaced (its namespaces must be configured again).
+    local DFS_ROOT DFS_SHARE DFS_NAMESPACES DFS_PREFER
+    if [[ -f "$DFS_CONF" ]] && ! dfs_conf_load; then
+        echo "[dfs-init] replacing malformed $DFS_CONF; re-run dfs-configure" >&2
     fi
+    dfs_conf_save "$root" "$share" "${DFS_NAMESPACES:-}" "${DFS_PREFER:-}" \
+        || { echo "[dfs-init] could not write $DFS_CONF" >&2; return 1; }
     smbcontrol all reload-config 2>/dev/null || true
     echo "[dfs-init] done. Configure namespaces with: samba-sconfig dfs-configure NS1 [NS2 ...]"
     # Nudge the operator to refresh the firewall ruleset header so it
@@ -3603,8 +3635,7 @@ cli_dfs_init() {
 
 cli_dfs_configure() {
     [[ -f "$DFS_CONF" ]] || { echo "[dfs-configure] run dfs-init first" >&2; return 1; }
-    # shellcheck disable=SC1090
-    source "$DFS_CONF"
+    dfs_conf_load || return 1
     local ns_list="${SC_DFS_NS:-$*}"
     local prefer="${SC_DFS_PREFER:-${DFS_PREFER:-}}"
     [[ -z "$ns_list" ]] && { echo "[dfs-configure] no namespaces given" >&2; return 1; }
@@ -3630,10 +3661,11 @@ cli_dfs_configure() {
         install -d -m 0755 "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}"
         : > "${DFS_ROOT:-$DFS_DEFAULT_ROOT}/${n}/${DFS_SENTINEL_NAME}"
     done
-    sed -i \
-        -e "s|^DFS_NAMESPACES=.*|DFS_NAMESPACES=\"${ns_list}\"|" \
-        -e "s|^DFS_PREFER=.*|DFS_PREFER=\"${prefer}\"|" \
-        "$DFS_CONF"
+    # A prefer-regex is data: kvstate escapes it, so any printable regex
+    # (e.g. ^\\\\WIN-) is stored and read back exactly.
+    ns_list=$(printf '%s' "$ns_list" | tr -s ' ' | sed 's/^ //; s/ $//')
+    dfs_conf_save "${DFS_ROOT:-$DFS_DEFAULT_ROOT}" "${DFS_SHARE:-}" "$ns_list" "$prefer" \
+        || { echo "[dfs-configure] could not save (the prefer-regex must be printable text)" >&2; return 1; }
     echo "[dfs-configure] namespaces=${ns_list} prefer=${prefer:-<none>}"
 }
 
@@ -3672,9 +3704,9 @@ cli_dfs_status() {
     echo
     echo "Drop-in:    ${DFS_INCLUDE_FILE} $([[ -f $DFS_INCLUDE_FILE ]] && echo present || echo absent)"
     echo "Config:     ${DFS_CONF} $([[ -f $DFS_CONF ]] && echo present || echo absent)"
-    if [[ -f "$DFS_CONF" ]]; then
-        # shellcheck disable=SC1090
-        source "$DFS_CONF"
+    if [[ -f "$DFS_CONF" ]] && ! dfs_conf_load 2>/dev/null; then
+        echo "Config is malformed; re-run dfs-init and dfs-configure."
+    elif [[ -f "$DFS_CONF" ]]; then
         echo "Root:       ${DFS_ROOT:-?}"
         echo "Share:      ${DFS_SHARE:-?}"
         echo "Namespaces: ${DFS_NAMESPACES:-<none>}"
