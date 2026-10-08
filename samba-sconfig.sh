@@ -508,6 +508,7 @@ config_hostname() {
     fi
 }
 
+# shellcheck disable=SC2120 # optional iface argument; current callers use the default
 get_addr_source() {
     # Report whether the default interface currently has a DHCP lease,
     # a static assignment, or nothing. Used by config_network to decide
