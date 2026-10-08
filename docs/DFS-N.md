@@ -204,17 +204,26 @@ arguments (or reads them from a config file written by
    is auto-derived from `samba-tool domain info` or
    `/etc/samba/smb.conf`'s realm; `--base-dn` is an explicit
    override.
-3. **Empty-result guard**: if the query returns zero link
-   objects, *log a warning and exit 0 without pruning*. Empty
-   namespaces are valid; the prune happens only when we have a
-   confirmed authoritative list.
+3. **Authoritative-result rule** (code-review session plan 04): a
+   successful query is authoritative, including one with zero link
+   objects — every managed link under the namespace is then pruned. A
+   failed query (including a deleted namespace container), or any link
+   record that is rejected (bad path, bad target, unknown target state,
+   parse failure, or a record missing its path or target list), makes the
+   result incomplete: valid links are still written, but nothing is
+   pruned, so the last known-good links stay.
 4. **Sentinel guard**: refuse to operate if
    `/srv/samba/dfs_root/.dfsn-managed` is missing. Forces an
    explicit `dfs-init` first.
 5. **Parse**: invoke the Python helper for each link's
    `msDFS-TargetListv2`. Output: TSV records, one per target
    (`priorityClass\tpriorityRank\tstate\tunc`).
-6. **Validate paths and targets** (see §7).
+6. **Validate paths and targets** (see §7). Target `state` is compared
+   case-insensitively; only `online` and `offline` are known, and any other
+   value rejects the link. Offline targets are dropped. A link with no
+   online target (or an empty target list) is a valid **withdrawal**: it is
+   left out of the authoritative set, so its symlink is pruned. Withdrawals
+   are logged as `withdrawn`, separately from `rejected`.
 7. **Order targets**: by AD-supplied priority class and rank first, then
    by an operator-supplied per-namespace preference list (regex
    on UNC) for tie-breaking. Default tie-break: stable AD order.
@@ -406,9 +415,14 @@ the existing `samba-ad-dc` install.
 The automatic proxy block is delimited in `/etc/samba/smb.conf` and is
 the only content that `dfs-root-sync` may replace. Discovery, parsing,
 validation, collision checking, and `testparm` validation complete before
-the file changes. Any failure retains the last known-good block. Targets
-marked offline and targets naming this DC are excluded; if that leaves no
-usable target, the sync fails visibly instead of creating a loop.
+the file changes. Any failure (discovery, parse, an invalid target, an
+unknown target state, collision, `testparm`) retains the last known-good
+block byte for byte. Targets marked offline (any case) and targets naming
+this DC are excluded. A namespace left with no usable target — all
+offline, only this DC, or an empty list — is a valid **withdrawal**: its
+proxy section is removed so clients stop being referred to a dead or
+looping target, while the other namespaces still update. It returns as
+soon as AD lists an online target again.
 
 ## 10. Test plan
 
@@ -506,7 +520,10 @@ regression tests.
   by a local unit harness during development. Automatic root parsing,
   self-loop exclusion, stale removal, collision handling, legacy-v1 roots,
   and last-known-good preservation are covered by
-  `tests/dfs-root-proxy.bats`. Promoting the malformed-link case to a
+  `tests/dfs-root-proxy.bats`. Withdrawal and deletion convergence for both
+mechanisms (online → offline → online, last link and namespace deletion,
+incomplete results keeping last known-good, foreign entries kept) is
+covered by `tests/dfs-withdrawal.bats`. Promoting the malformed-link case to a
   proper end-to-end injection requires teaching the setup script
   to mint a fully-attributed bad link.
 

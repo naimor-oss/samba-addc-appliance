@@ -2029,9 +2029,10 @@ _dfs_root_proxy_strip_managed_block() {
     ' "$input"
 }
 
-# Convert parsed target records to "name<TAB>proxy-list". The update is
-# all-or-nothing: malformed online targets reject the entire sync, while
-# offline targets and this DC's own target are intentionally omitted.
+# Convert parsed target records to "name<TAB>proxy-list". Returns 0 with a
+# record, 2 (withdrawn, nothing printed) when no non-local online target
+# remains, or 1 when the metadata is invalid; see the result classes above.
+# Offline targets and this DC's own target are omitted.
 _dfs_root_proxy_render_parsed() {
     local name="$1" parsed="$2"
     _dfs_root_name_validate "$name" || {
@@ -2043,19 +2044,23 @@ _dfs_root_proxy_render_parsed() {
     local online=""
     while IFS=$'\t' read -r priority rank state unc; do
         [[ -n "$unc" ]] || continue
-        state_lc=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
-        [[ "$state_lc" == "online" ]] || continue
+        _dfs_target_state_known "$state" || {
+            echo "[dfs-root/$name] unknown target state '$state': $unc" >&2
+            return 1
+        }
         _dfs_validate_target_unc "$unc" || {
             echo "[dfs-root/$name] invalid target: $unc" >&2
             return 1
         }
+        state_lc=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
+        [[ "$state_lc" == "online" ]] || continue
         _dfs_root_target_is_local "$unc" && continue
         online+="${priority}"$'\t'"${rank}"$'\t'"${state}"$'\t'"${unc}"$'\n'
     done <<< "$parsed"
 
     [[ -n "$online" ]] || {
-        echo "[dfs-root/$name] no non-local online targets; refusing a self-referral" >&2
-        return 1
+        echo "[dfs-root/$name] withdrawn: no non-local online target" >&2
+        return 2
     }
 
     local ordered target proxy=""
@@ -2077,10 +2082,15 @@ _dfs_root_proxy_render_record() {
         echo "[dfs-root/$name] missing msDFS-TargetListv2" >&2
         return 1
     }
-    parsed=$(_dfs_render_targets "$blob") || {
+    local rc=0
+    parsed=$(_dfs_render_targets "$blob") || rc=$?
+    if (( rc == 2 )); then
+        echo "[dfs-root/$name] withdrawn: target list is empty" >&2
+        return 2
+    elif (( rc != 0 )); then
         echo "[dfs-root/$name] target-list parse failed" >&2
         return 1
-    }
+    fi
     _dfs_root_proxy_render_parsed "$name" "$parsed"
 }
 
@@ -2090,14 +2100,18 @@ _dfs_root_proxy_render_record() {
 # pass it through the same validation/self-loop filter as v2 metadata.
 _dfs_root_proxy_render_v1_record() {
     local name="$1" remotes="$2" unc parsed=""
+    [[ -n "$remotes" ]] || {
+        echo "[dfs-root/$name] domain-v1 root has no remoteServerName attribute" >&2
+        return 1
+    }
     while IFS= read -r unc; do
         [[ -n "$unc" ]] || continue
         [[ "$unc" == "*" ]] && continue
         parsed+=$'siteCostNormal\t0\tonline\t'"${unc}"$'\n'
     done <<< "$remotes"
     [[ -n "$parsed" ]] || {
-        echo "[dfs-root/$name] domain-v1 root has no remoteServerName targets" >&2
-        return 1
+        echo "[dfs-root/$name] withdrawn: domain-v1 root lists no targets" >&2
+        return 2
     }
     _dfs_root_proxy_render_parsed "$name" "$parsed"
 }
@@ -2145,16 +2159,20 @@ _dfs_sync_domain_root_proxies() (
     }
     installed="${candidate}.installed"
 
-    local cur_class="" cur_name="" cur_blob="" cur_remotes="" record_failed=0
+    local cur_class="" cur_name="" cur_blob="" cur_remotes="" record_failed=0 withdrawn=0
     _dfs_root_flush_record() {
+        local rc=0
         if [[ -n "$cur_name" || -n "$cur_blob" || -n "$cur_remotes" ]]; then
             if [[ "$cur_class" == "fTDfs" ]]; then
-                _dfs_root_proxy_render_v1_record "$cur_name" "$cur_remotes" >> "$records" \
-                    || record_failed=1
+                _dfs_root_proxy_render_v1_record "$cur_name" "$cur_remotes" >> "$records" || rc=$?
             else
-                _dfs_root_proxy_render_record "$cur_name" "$cur_blob" >> "$records" \
-                    || record_failed=1
+                _dfs_root_proxy_render_record "$cur_name" "$cur_blob" >> "$records" || rc=$?
             fi
+            case "$rc" in
+                0) ;;
+                2) withdrawn=$((withdrawn + 1)) ;;
+                *) record_failed=1 ;;
+            esac
         fi
         cur_class=""; cur_name=""; cur_blob=""; cur_remotes=""
     }
@@ -2252,7 +2270,7 @@ _dfs_sync_domain_root_proxies() (
         echo "[dfs-root] configuration installed, but Samba reload failed" >&2
         return 1
     fi
-    echo "[dfs-root] domain namespace proxies updated"
+    echo "[dfs-root] domain namespace proxies updated (withdrawn: ${withdrawn})"
 )
 
 _dfs_install_root_proxy_timer() {
@@ -2322,7 +2340,7 @@ readonly DFS_DEFAULT_ROOT="/srv/samba/dfs_root"
 readonly DFS_DEFAULT_SHARE="dfs_root"
 readonly DFS_INCLUDE_FILE="/etc/samba/conf.d/dfs-root.conf"
 readonly DFS_SENTINEL_NAME=".dfsn-managed"
-readonly DFS_LOCK="/run/samba-dfs-update.lock"
+readonly DFS_LOCK="${SAMBA_DFS_LOCK:-/run/samba-dfs-update.lock}"
 readonly DFS_CONF="${SAMBA_DFS_CONF:-/etc/samba/dfs-update.conf}"
 readonly -a DFS_KEYS=(DFS_ROOT DFS_SHARE DFS_NAMESPACES DFS_PREFER)
 
@@ -2352,7 +2370,7 @@ dfs_conf_save() {
 readonly DFS_PARSE_HELPER="/usr/local/sbin/samba-dfs-parse-targets"
 readonly DFS_UNIT="/etc/systemd/system/samba-dfs-update.service"
 readonly DFS_TIMER="/etc/systemd/system/samba-dfs-update.timer"
-readonly DFS_LOG="/var/log/samba/dfs-update.log"
+readonly DFS_LOG="${SAMBA_DFS_LOG:-/var/log/samba/dfs-update.log}"
 
 # Convert a dotted realm (lab.test) to a comma-joined base DN (DC=lab,DC=test).
 # Lower-cased on output. Returns 1 if smb.conf has no realm.
@@ -2461,6 +2479,22 @@ _dfs_unwrap_ldif() {
 # the Python helper. Each line:
 #   priorityClass\tpriorityRank\tstate\tunc
 # Helper exits non-zero on parse failure (handled below).
+# Result classes shared by both DFS mechanisms (code-review session plan 04):
+#   0  valid, with targets to publish
+#   2  valid but withdrawn: no usable online target (all offline, only this
+#      DC, or an authoritative empty target list). The managed referral is
+#      removed so clients stop being sent to a dead target.
+#   1  indeterminate or invalid: discovery, parse, or validation failed, or
+#      a target carries an unknown state. The last known-good configuration
+#      is kept byte for byte.
+# Target state is compared case-insensitively; only "online" and "offline"
+# are known.
+_dfs_target_state_known() {
+    local state_lc
+    state_lc=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    [[ "$state_lc" == online || "$state_lc" == offline ]]
+}
+
 _dfs_render_targets() {
     local blob_b64="$1"
     [[ -x "$DFS_PARSE_HELPER" ]] || { echo "[dfs] parse helper missing: $DFS_PARSE_HELPER" >&2; return 1; }
@@ -2739,9 +2773,13 @@ _dfs_run_update() {
     return "$rc"
 }
 
-# Core per-namespace pass. Three guards:
-#  - empty result: warn, leave filesystem alone, do not prune.
-#  - sentinel missing on the per-NS dir: refuse to operate on that NS.
+# Core per-namespace pass (result classes above):
+#  - authoritative result (search succeeded, every record valid or
+#    withdrawn): publish valid links and prune every other managed link,
+#    including all of them when the namespace has zero links;
+#  - incomplete result (search failure, missing base, any rejected record):
+#    publish the valid links but prune nothing;
+#  - sentinel missing on the per-NS dir: refuse to operate on that NS;
 #  - prune scope: only msdfs:* symlinks under the per-NS subtree, never
 #    files we don't own.
 _dfs_update_one_namespace() {
@@ -2775,21 +2813,11 @@ _dfs_update_one_namespace() {
     local unwrapped
     unwrapped=$(printf '%s\n' "$raw" | _dfs_unwrap_ldif)
 
-    # Empty-result guard: if we see no link-path attributes at all, refuse to
-    # prune. An empty namespace is valid; we just exit without changes.
-    local link_count
-    link_count=$(grep -c '^msDFS-LinkPathv2: ' <<< "$unwrapped" || true)
-    if (( link_count == 0 )); then
-        echo "[dfs/${ns}] zero links returned — skipping prune (safety)" >&2
-        return 0
-    fi
-
     local keep_file
     keep_file=$(mktemp)
-    # Bash RETURN traps fire on EVERY enclosing function return (no `set -T`
-    # functrace here), so $keep_file would be out of scope when dfs_update
-    # itself returns — set -u would then trip. Guard with default expansion.
-    trap 'rm -f -- "${keep_file:-}"' RETURN
+    # Removed explicitly on both exits below. A RETURN trap is not safe here:
+    # with functrace on it also fires when the nested _flush returns, which
+    # deleted the keep list before the prune read it.
 
     # Walk records. LDIF groups attrs of one entry between successive
     # `dn:` lines (or a blank line at the end). We commit the record on
@@ -2797,13 +2825,21 @@ _dfs_update_one_namespace() {
     # parser is order-independent — ldb returns attrs alphabetically
     # today but that's not load-bearing.
     local cur_path="" cur_blob=""
-    local applied=0 rejected=0
+    local applied=0 rejected=0 withdrawn=0
     _flush() {
-        if [[ -n "$cur_path" && -n "$cur_blob" ]]; then
-            if _dfs_apply_one_link "$ns" "$ns_root" "$cur_path" "$cur_blob" "$keep_file" "$dry"; then
-                applied=$((applied+1))
-            else
+        local rc=0
+        if [[ -n "$cur_path" || -n "$cur_blob" ]]; then
+            if [[ -z "$cur_path" || -z "$cur_blob" ]]; then
+                # A link record missing its path or targets is incomplete.
+                echo "[dfs/${ns}] reject incomplete link record: ${cur_path:-<no path>}" >&2
                 rejected=$((rejected+1))
+            else
+                _dfs_apply_one_link "$ns" "$ns_root" "$cur_path" "$cur_blob" "$keep_file" "$dry" || rc=$?
+                case "$rc" in
+                    0) applied=$((applied+1)) ;;
+                    2) withdrawn=$((withdrawn+1)) ;;
+                    *) rejected=$((rejected+1)) ;;
+                esac
             fi
         fi
         cur_path=""; cur_blob=""
@@ -2818,14 +2854,20 @@ _dfs_update_one_namespace() {
     done <<< "$unwrapped"
     _flush
 
-    echo "[dfs/${ns}] applied=${applied} rejected=${rejected}" >&2
+    echo "[dfs/${ns}] applied=${applied} withdrawn=${withdrawn} rejected=${rejected}" >&2
     {
-        echo "$(date -Is) ns=${ns} applied=${applied} rejected=${rejected} dry=${dry}"
+        echo "$(date -Is) ns=${ns} applied=${applied} withdrawn=${withdrawn} rejected=${rejected} dry=${dry}"
     } >> "$DFS_LOG"
 
-    if [[ "$dry" != "1" && "$applied" -gt 0 ]]; then
+    if (( rejected > 0 )); then
+        echo "[dfs/${ns}] result incomplete (${rejected} rejected); keeping existing links, no prune" >&2
+        rm -f -- "$keep_file"
+        return 1
+    fi
+    if [[ "$dry" != "1" ]]; then
         _dfs_prune "$ns_root" "$keep_file"
     fi
+    rm -f -- "$keep_file"
     return 0
 }
 
@@ -2840,29 +2882,45 @@ _dfs_apply_one_link() {
     }
 
     # The helper emits TSV records: priorityClass\tpriorityRank\tstate\tunc.
-    local tsv_records
-    tsv_records=$(_dfs_render_targets "$blob_b64") || {
+    # Exit 2 is an authoritative empty target list: withdraw the link.
+    local tsv_records parse_rc=0
+    tsv_records=$(_dfs_render_targets "$blob_b64") || parse_rc=$?
+    if (( parse_rc == 2 )); then
+        echo "[dfs/${ns}] withdrawn: $rel has no targets" >&2
+        return 2
+    elif (( parse_rc != 0 )); then
         echo "[dfs/${ns}] target parse failed for: $rel" >&2
         return 1
-    }
+    fi
 
-    # Validate every UNC. One bad target rejects the whole link — partial
-    # target lists would silently downgrade the referral. The 4th tab-
-    # separated field is the UNC.
-    local rec u
+    # Validate every UNC and state. One bad target rejects the whole link —
+    # partial target lists would silently downgrade the referral. Only
+    # online targets are published; offline ones are dropped.
+    local rec u state online=""
     while IFS= read -r rec; do
         [[ -z "$rec" ]] && continue
         u="${rec##*$'\t'}"
+        state=$(printf '%s' "$rec" | cut -f3)
+        _dfs_target_state_known "$state" || {
+            echo "[dfs/${ns}] reject unknown target state '$state': $u (link $rel)" >&2
+            return 1
+        }
         _dfs_validate_target_unc "$u" || {
             echo "[dfs/${ns}] reject target: $u (link $rel)" >&2
             return 1
         }
+        [[ "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" == online ]] \
+            && online+="${rec}"$'\n'
     done <<< "$tsv_records"
+    if [[ -z "$online" ]]; then
+        echo "[dfs/${ns}] withdrawn: $rel has no online target" >&2
+        return 2
+    fi
 
     # Order by AD priority class/rank first, then by prefer regex among ties.
     # Output is one UNC per line.
     local ordered
-    ordered=$(printf '%s\n' "$tsv_records" | _dfs_order_targets "${DFS_PREFER:-}")
+    ordered=$(printf '%s' "$online" | _dfs_order_targets "${DFS_PREFER:-}")
 
     # Build the symlink target string: "msdfs:srv1\share,srv2\share"
     local joined="" first=1
