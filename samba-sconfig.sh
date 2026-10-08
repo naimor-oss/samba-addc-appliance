@@ -759,6 +759,60 @@ EOF
 #===============================================================================
 # 2. DOMAIN OPERATIONS
 #===============================================================================
+
+# Secret-free authentication (code-review session plan 01). A password
+# must never reach a process argument vector: /proc/<pid>/cmdline is
+# readable by every local user. /usr/bin/samba-tool is only a launcher for
+# samba.netcmd.main.samba_tool(*args), so samba_tool_secret runs that entry
+# point in-process with the secret read from stdin; the visible argv holds
+# just the option name. C tools (smbclient, net) read a root-only
+# authentication file that is removed when the command returns.
+readonly SAMBA_TOOL_STDIN_PY='import signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+if len(sys.argv) < 3 or sys.argv[2] != "--":
+    sys.exit("usage: OPTION -- samba-tool-args")
+from samba.netcmd.main import samba_tool
+secret = sys.stdin.readline().rstrip("\n")
+args = sys.argv[3:] + [sys.argv[1] + "=" + secret]
+del secret
+sys.exit(samba_tool(*args))'
+
+# samba_tool_secret OPTION SECRET ARGS...
+#   e.g. samba_tool_secret --password "$pass" domain join REALM DC -U user
+samba_tool_secret() {
+    local opt="$1" secret="$2"
+    shift 2
+    # printf is a shell builtin: the secret goes down the pipe, not into argv.
+    printf '%s\n' "$secret" | python3 -c "$SAMBA_TOOL_STDIN_PY" "$opt" -- "$@"
+}
+
+# run_with_auth_file DOMAIN USER SECRET COMMAND ARGS...
+#   Runs COMMAND ARGS... -A <file>. Samba trims whitespace around values in
+#   authentication files, so a secret with leading/trailing blanks would be
+#   silently altered; refuse it instead.
+run_with_auth_file() {
+    local domain="$1" user="$2" secret="$3"
+    shift 3
+    if [[ "$secret" =~ ^[[:space:]]|[[:space:]]$ ]]; then
+        echo "[sconfig] passwords with leading or trailing spaces are not supported here" >&2
+        return 2
+    fi
+    local dir rc=0
+    dir=$(mktemp -d "${SCONFIG_AUTH_DIR:-/run}/samba-sconfig-auth.XXXXXX") || return 1
+    chmod 0700 "$dir"
+    # The redirect sits inside the subshell so the file is created under
+    # umask 077 (0600), not the caller's umask.
+    (
+        umask 077
+        {
+            printf 'username = %s\npassword = %s\n' "$user" "$secret"
+            [[ -z "$domain" ]] || printf 'domain = %s\n' "$domain"
+        } > "$dir/auth"
+    )
+    "$@" -A "$dir/auth" || rc=$?
+    rm -rf "$dir"
+    return "$rc"
+}
 menu_domain_ops() {
     if is_provisioned; then
         info "Already provisioned.\n\nRealm: $(get_realm)\nNetBIOS: $(get_netbios)\n\nTo re-provision, remove /etc/samba/smb.conf and\n/var/lib/samba/private/ contents first."
@@ -984,8 +1038,8 @@ seed_sysvol() {
     tmpdir=$(mktemp -d)
 
     echo "[sconfig] seeding SYSVOL from //${src_dc}/sysvol/${realm_lower} ..."
-    if smbclient "//${src_dc}/sysvol" \
-            -U "${netbios}\\${admin_user}%${admin_pass}" \
+    if run_with_auth_file "$netbios" "$admin_user" "$admin_pass" \
+            smbclient "//${src_dc}/sysvol" \
             -c "recurse ON; prompt OFF; lcd ${tmpdir}; mget ${realm_lower}" \
             >/dev/null 2>&1; then
         if [[ -d "${tmpdir}/${realm_lower}" ]]; then
@@ -1108,8 +1162,9 @@ register_own_ptr() {
 
     echo "[sconfig] registering PTR  ${reverse_name}.${reverse_zone}  →  ${my_fqdn}."
     local out ptr_ok=false
-    if out=$(samba-tool dns add "$target_dc" "$reverse_zone" "$reverse_name" PTR "${my_fqdn}." \
-                -U"${netbios}\\${admin_user}" --password="$admin_pass" 2>&1); then
+    if out=$(samba_tool_secret --password "$admin_pass" \
+                dns add "$target_dc" "$reverse_zone" "$reverse_name" PTR "${my_fqdn}." \
+                -U"${netbios}\\${admin_user}" 2>&1); then
         echo "[sconfig] PTR registered on $target_dc"
         ptr_ok=true
     elif grep -qiE "already exist|DNS_ERROR_RECORD_ALREADY_EXISTS" <<< "$out"; then
@@ -1124,8 +1179,8 @@ register_own_ptr() {
         # registered lingers in /showrepl /errorsonly for ~15 min until KCC's
         # next scheduled run.
         echo "[sconfig] forcing KCC on $target_dc to clear stale 8524..."
-        samba-tool drs kcc "$target_dc" \
-            -U"${netbios}\\${admin_user}" --password="$admin_pass" 2>&1 \
+        samba_tool_secret --password "$admin_pass" drs kcc "$target_dc" \
+            -U"${netbios}\\${admin_user}" 2>&1 \
             | sed 's/^/[kcc] /' || true
         return 0
     fi
@@ -1165,10 +1220,9 @@ domain_provision_new() {
     prov_log=$(mktemp -t samba-provision.XXXXXX)
     {
         echo "10"; echo "XXX"; echo "Provisioning AD domain..."; echo "XXX"
-        samba-tool domain provision \
+        samba_tool_secret --adminpass "$DC_ADMIN_PASS" domain provision \
             --realm="$DC_REALM" --domain="$DC_NETBIOS" \
             --server-role=dc --dns-backend=SAMBA_INTERNAL \
-            --adminpass="$DC_ADMIN_PASS" \
             --option="dns forwarder = $DC_DNS_FORWARDER" \
             >"$prov_log" 2>&1
         printf '%d' "$?" > "${prov_log}.rc"
@@ -1263,12 +1317,11 @@ domain_join_dc() {
 
     whiptail --infobox "Joining domain at FL=$fl_str... This may take several minutes." 8 60
 
-    if samba-tool domain join "$DC_REALM" DC \
+    if samba_tool_secret --password "$DC_ADMIN_PASS" domain join "$DC_REALM" DC \
         --dns-backend=SAMBA_INTERNAL \
         --option="dns forwarder = $DC_DNS_FORWARDER" \
         --option="ad dc functional level = $fl_str" \
-        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}" \
-        --password="$DC_ADMIN_PASS" 2>&1 | tail -20; then
+        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}" 2>&1 | tail -20; then
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
@@ -1318,12 +1371,11 @@ domain_join_rodc() {
 
     whiptail --infobox "Joining as RODC at FL=$fl_str..." 8 60
 
-    if samba-tool domain join "$DC_REALM" RODC \
+    if samba_tool_secret --password "$DC_ADMIN_PASS" domain join "$DC_REALM" RODC \
         --dns-backend=SAMBA_INTERNAL \
         --option="dns forwarder = $DC_DNS_FORWARDER" \
         --option="ad dc functional level = $fl_str" \
-        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}" \
-        --password="$DC_ADMIN_PASS" 2>&1 | tail -20; then
+        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}" 2>&1 | tail -20; then
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
@@ -1504,7 +1556,7 @@ reset_admin_password() {
     confirm_pass=$(whiptail --passwordbox "Confirm:" 10 64 3>&1 1>&2 2>&3) || return
     [[ "$new_pass" != "$confirm_pass" ]] && { info "Passwords don't match."; return; }
 
-    if samba-tool user setpassword administrator --newpassword="$new_pass" 2>&1; then
+    if samba_tool_secret --newpassword "$new_pass" user setpassword administrator 2>&1; then
         info "Password updated."
     else
         info "ERROR: Check complexity requirements."
@@ -3444,12 +3496,11 @@ cli_join_dc() {
     echo -e "search ${DC_REALM,,}\nnameserver ${dc_ip}" > /etc/resolv.conf
 
     echo "[sconfig] joining $DC_REALM as $SC_ROLE via $SC_DC ($dc_ip), user=${DC_NETBIOS}\\${DC_ADMIN_USER}, FL=$fl_str..."
-    if samba-tool domain join "$DC_REALM" "$SC_ROLE" \
+    if samba_tool_secret --password "$DC_ADMIN_PASS" domain join "$DC_REALM" "$SC_ROLE" \
         --dns-backend=SAMBA_INTERNAL \
         --option="dns forwarder = $DC_DNS_FORWARDER" \
         --option="ad dc functional level = $fl_str" \
-        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}" \
-        --password="$DC_ADMIN_PASS"; then
+        -U"${DC_NETBIOS}\\${DC_ADMIN_USER}"; then
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         register_own_ptr "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || true
@@ -3482,10 +3533,9 @@ cli_provision_new() {
     systemctl stop samba-ad-dc 2>/dev/null || true
     write_krb5_conf "$DC_REALM"
 
-    if samba-tool domain provision \
+    if samba_tool_secret --adminpass "$DC_ADMIN_PASS" domain provision \
             --realm="$DC_REALM" --domain="$DC_NETBIOS" \
             --server-role=dc --dns-backend=SAMBA_INTERNAL \
-            --adminpass="$DC_ADMIN_PASS" \
             --option="dns forwarder = $DC_DNS_FORWARDER" 2>&1 | tail -10; then
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
