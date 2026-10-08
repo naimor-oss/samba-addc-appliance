@@ -116,6 +116,7 @@ lab/run-scenario.sh join-dc --verify-only
 
 ```bash
 bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
+bash tests/sysvol-publish.sh
 ```
 
 ## Development Rules
@@ -154,6 +155,13 @@ bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 ## Important Samba Interop Notes
 
 - Samba does not implement DFSR. SYSVOL must be seeded or synced out of band.
+  `sysvol-sync` never writes or deletes inside a live GPO tree: it stages on
+  the SYSVOL filesystem, validates, and publishes with one rename or one
+  atomic directory exchange; replaced and orphaned trees are kept for
+  `sysvol-sync --rollback GUID`. Do not reintroduce `rsync --delete` (or any
+  delete-then-rename) on the live path. `tests/sysvol-publish.sh` runs a
+  concurrent reader and fault injection against the generated code
+  (code-review session plan 03).
 - Every provision/join automatically mirrors AD domain DFS roots into managed
   `msdfs proxy` shares and keeps them converged. The separate optional
   tertiary-target mode materializes AD-replicated `msDFS-Linkv2` objects as
