@@ -139,6 +139,17 @@ bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
   0700 directory under `/run`, mode 0600, removed when the command
   returns; secrets with leading/trailing spaces are refused because
   Samba trims them). `tests/secret-free-auth.sh` enforces this.
+- Never `source` or `.` a settings or state file (`/etc/samba/dfs-update.conf`,
+  `/etc/samba/sysvol-sync.conf`, `/var/lib/samba-init-detected.env`), and
+  never write one with a heredoc or `sed -i`. Use appliance-core
+  `kvstate.sh` (`dfs_conf_load`/`dfs_conf_save`, `appcore_kv_load`/
+  `appcore_kv_write`) with the file's key list (`DFS_KEYS`,
+  `SYSVOL_SYNC_KEYS`). A malformed file fails closed: `dfs-update` and
+  `sysvol-sync` stop with a message instead of guessing. Values such as a
+  DFS prefer-regex are stored escaped and read back exactly. The POSIX
+  login banner reads single keys with `awk` and keeps only host-name
+  characters. `tests/settings-state.bats` enforces this (code-review
+  session plan 05).
 
 ## Important Samba Interop Notes
 

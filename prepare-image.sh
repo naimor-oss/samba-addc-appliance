@@ -502,6 +502,12 @@ if [[ -n "$LIB_SRC" ]]; then
     for libfile in "$LIB_TARGET"/*.sh; do
         bash -n "$libfile" || { err "vendored lib failed bash -n: $libfile"; exit 1; }
     done
+    # Every settings reader on the appliance depends on kvstate.sh
+    # (code-review session plan 05); an image without it fails closed.
+    [[ -f "$LIB_TARGET/kvstate.sh" ]] || {
+        err "appliance-core lib has no kvstate.sh; build from appliance-core >= 0.12.0"
+        exit 1
+    }
     log "  vendored $dst_count appliance-core lib(s) into $LIB_TARGET"
 
     PROV_FILE=/etc/appliance-core.provenance
@@ -692,11 +698,22 @@ fatal() { say "ERROR: $*"; exit 1; }
 
 [[ -f "$SMBCONF" ]] || fatal "smb.conf not found"
 [[ -f "$SAMDB"   ]] || fatal "Samba SAM not found at $SAMDB (DC not provisioned?)"
-# shellcheck disable=SC1090
-[[ -f "$CONF" ]] && . "$CONF" || true   # config is optional; defaults are fine
-
-PREFERRED_DCS="${PREFERRED_DCS:-}"
-EXCLUDE_DCS="${EXCLUDE_DCS:-}"
+# The config is optional (defaults are fine) and is parsed as data, never
+# sourced (code-review session plan 05). A malformed file stops the sync.
+PREFERRED_DCS="" EXCLUDE_DCS="" SYNC_INTERVAL=""
+if [[ -f "$CONF" ]]; then
+    KVSTATE=/usr/local/lib/appliance-core/kvstate.sh
+    [[ -r "$KVSTATE" ]] || fatal "state parser $KVSTATE is missing"
+    # shellcheck disable=SC1090
+    source "$KVSTATE"
+    appcore_kv_load "$CONF" SYNC_INTERVAL PREFERRED_DCS EXCLUDE_DCS 2>/dev/null \
+        || fatal "$CONF is malformed; re-run samba-sconfig SYSVOL sync configure"
+fi
+for _dc in $PREFERRED_DCS $EXCLUDE_DCS; do
+    [[ "$_dc" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$ ]] \
+        || fatal "$CONF lists an invalid host name"
+done
+unset _dc
 
 # Single-instance lock for the sync mode; --status is read-only and skipped.
 if [[ "$MODE" == "sync" ]]; then
@@ -1493,6 +1510,10 @@ for d in "$APPCORE_DET_DHCP_DOMAIN" "$APPCORE_DET_PTR_DOMAIN"; do
     fi
 done
 
+# SRV answers are untrusted network data (code-review session plan 05).
+_host_re='^[A-Za-z0-9]([A-Za-z0-9.-]{0,252}[A-Za-z0-9])?$'
+[[ "${samba_det_ad_dc:-}" =~ $_host_re ]] || samba_det_ad_dc=""
+[[ "${samba_det_ad_realm:-}" =~ $_host_re ]] || samba_det_ad_realm=""
 cat >> "$DETECT_FILE" <<DETEOF
 SAMBA_DET_AD_DC="${samba_det_ad_dc:-}"
 SAMBA_DET_AD_REALM="${samba_det_ad_realm:-}"
@@ -1603,7 +1624,7 @@ set -u
 # absent (older images that predate the vendoring).
 APPCORE_LIBS=/usr/local/lib/appliance-core
 if [[ -d "$APPCORE_LIBS" ]]; then
-    for _lib in apt-helpers detect-net identity tui hostname netconfig timezone; do
+    for _lib in apt-helpers kvstate detect-net identity tui hostname netconfig timezone; do
         [[ -f "$APPCORE_LIBS/${_lib}.sh" ]] && source "$APPCORE_LIBS/${_lib}.sh"
     done
     unset _lib
@@ -1639,9 +1660,13 @@ load_detect_env() {
     DET_PTR_FQDN="" DET_PTR_NAME="" DET_PTR_DOMAIN=""
     DET_EFFECTIVE_DOMAIN="" DET_AD_DC="" DET_AD_REALM=""
     SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""
-    if [[ -f "$DETECT_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$DETECT_FILE"
+    # Parsed as data, never sourced (code-review session plan 05).
+    if [[ -f "$DETECT_FILE" ]] && declare -F appcore_kv_load >/dev/null; then
+        appcore_kv_load "$DETECT_FILE" APPCORE_DET_IP APPCORE_DET_GATEWAY \
+            APPCORE_DET_DHCP_DNS APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN \
+            APPCORE_DET_PTR_NAME APPCORE_DET_PTR_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN \
+            APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE SAMBA_DET_AD_DC SAMBA_DET_AD_REALM \
+            2>/dev/null || { SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""; }
     fi
     if command -v appcore_detect_net_init >/dev/null 2>&1; then
         appcore_detect_net_init "$DETECT_FILE" >/dev/null 2>&1 || true
@@ -2195,7 +2220,18 @@ log "Installing samba-net-status MOTD generator..."
 cat > /etc/update-motd.d/15-samba-net-status <<'MOTDEOF'
 #!/bin/sh
 DET=/var/lib/samba-init-detected.env
-[ -r "$DET" ] && . "$DET" 2>/dev/null
+# Read as data, never sourced (code-review session plan 05): single keys via
+# awk, keeping only characters a host or domain name can contain.
+kv() {
+    [ -r "$DET" ] || return 0
+    awk -v k="$1" 'index($0, k "=") == 1 { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$DET" \
+        | tr -cd 'A-Za-z0-9.-'
+}
+APPCORE_DET_PTR_FQDN=$(kv APPCORE_DET_PTR_FQDN)
+APPCORE_DET_EFFECTIVE_DOMAIN=$(kv APPCORE_DET_EFFECTIVE_DOMAIN)
+APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE=$(kv APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE)
+SAMBA_DET_AD_DC=$(kv SAMBA_DET_AD_DC)
+SAMBA_DET_AD_REALM=$(kv SAMBA_DET_AD_REALM)
 printf '\n  Samba Active Directory Domain Controller\n'
 printf '  ----------------------------------------\n'
 printf '  Hostname:    %s\n' "$(hostnamectl hostname 2>/dev/null || hostname)"
