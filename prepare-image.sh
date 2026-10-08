@@ -656,8 +656,12 @@ cat > /usr/local/sbin/sysvol-sync << 'SYNCEOF'
 #      we need AND its own LDAP versionNumber matches its on-disk GPT.INI
 #      (settled, no DFSR mid-flight). The first peer that answers yes is
 #      used as the source.
-#   5. The chosen GPO is pulled into a staging tmpdir and rsync'd into place
-#      atomically per-GPO, then the durable SYSVOL NTACL reset service runs
+#   5. The chosen GPO is downloaded into a staging directory on the SYSVOL
+#      filesystem, validated, and published per GPO with one rename (new
+#      GPO) or one atomic directory exchange (existing GPO); readers see the
+#      whole old or the whole new tree, never a mix. The replaced tree is
+#      kept detached for `sysvol-sync --rollback GUID`. Then the durable
+#      SYSVOL NTACL reset service runs
 #      once at the end if any GPO actually changed.
 #
 # Authentication uses smbclient -P (Privileged), which makes Samba's own
@@ -674,6 +678,8 @@ cat > /usr/local/sbin/sysvol-sync << 'SYNCEOF'
 # CLI:
 #   sysvol-sync                  one normal sync cycle (the cron entrypoint)
 #   sysvol-sync --status         print a freshness table; do not pull anything
+#   sysvol-sync --rollback GUID  exchange the retained previous generation of
+#                                one GPO back into place, then reset NTACLs
 
 set -u -o pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -685,7 +691,8 @@ LOGFILE="/var/log/samba/sysvol-sync.log"
 SAMDB="/var/lib/samba/private/sam.ldb"
 SMBCONF="/etc/samba/smb.conf"
 
-MODE="${1:-sync}"   # sync (default) | --status
+MODE="${1:-sync}"   # sync (default) | --status | --rollback GUID
+ROLLBACK_GUID="${2:-}"
 
 mkdir -p "$(dirname "$LOGFILE")"
 
@@ -716,7 +723,7 @@ done
 unset _dc
 
 # Single-instance lock for the sync mode; --status is read-only and skipped.
-if [[ "$MODE" == "sync" ]]; then
+if [[ "$MODE" == "sync" || "$MODE" == "--rollback" ]]; then
     exec 200>"$LOCKFILE"
     flock -n 200 || { say "skip: another sysvol-sync is already running"; exit 0; }
     if systemctl is-active --quiet samba-sysvol-acl-reset.service; then
@@ -805,6 +812,128 @@ fetch_remote_gpt_version() {
 }
 
 # TCP probe with a short timeout. /dev/tcp on bash is enough; we don't need nc.
+# --- BEGIN gpo-publish --------------------------------------------------------
+# Atomic per-GPO publication (code-review session plan 03). Nothing writes or
+# deletes inside a live GPO tree:
+#   - a download lands in $SYSVOL_STAGE_ROOT/incoming, on the same filesystem
+#     as the live Policies directory, and is validated there;
+#   - a new GPO is published with one rename(2);
+#   - an existing GPO is replaced with renameat2(RENAME_EXCHANGE), so a reader
+#     sees the whole old or the whole new tree. If the filesystem refuses the
+#     exchange, the live tree stays as it is (never delete-then-rename);
+#   - the replaced (or orphaned) tree is renamed to
+#     $SYSVOL_STAGE_ROOT/previous/<GUID> and kept for --rollback. Only an
+#     older, already detached generation is ever deleted.
+# The NTACL reset that follows publication rewrites ACLs on the live trees;
+# until it finishes, new content carries the ACLs it was downloaded with.
+: "${SYSVOL_STAGE_ROOT:=/var/lib/samba/sysvol-sync}"
+SYSVOL_PREVIOUS_DAYS=30
+
+# Fault injection for tests only: SYSVOL_SYNC_FAULT names one step to fail.
+_gpo_fault() {
+    [[ "${SYSVOL_SYNC_FAULT:-}" == "$1" ]] || return 0
+    say "fault injected at $1"
+    return 1
+}
+
+# Exchange two directories atomically. Non-zero (nothing changed) when the
+# kernel or filesystem does not support RENAME_EXCHANGE.
+gpo_exchange() {
+    _gpo_fault exchange || return 1
+    python3 -c '
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.renameat2(-100, os.fsencode(sys.argv[1]), -100, os.fsencode(sys.argv[2]), 2) != 0:
+    print("renameat2(RENAME_EXCHANGE): " + os.strerror(ctypes.get_errno()), file=sys.stderr)
+    sys.exit(1)
+' "$1" "$2"
+}
+
+# Prepare the staging area; refuse when it is not on the Policies filesystem
+# (a cross-device "rename" would be a copy, not an atomic publish).
+gpo_stage_ready() {
+    local policies="$1"
+    install -d -m 0700 "$SYSVOL_STAGE_ROOT" "$SYSVOL_STAGE_ROOT/incoming" \
+        "$SYSVOL_STAGE_ROOT/previous" || return 1
+    [[ -d "$policies" ]] || install -d -m 0755 "$policies" || return 1
+    if [[ "$(stat -c %d "$SYSVOL_STAGE_ROOT")" != "$(stat -c %d "$policies")" ]]; then
+        say "ERROR: $SYSVOL_STAGE_ROOT is not on the same filesystem as $policies"
+        return 1
+    fi
+    # Leftovers of an interrupted run were never live; drop them.
+    find "$SYSVOL_STAGE_ROOT/incoming" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+    # Bound retained generations: orphans and replaced trees older than
+    # $SYSVOL_PREVIOUS_DAYS days are detached copies, never the live one.
+    find "$SYSVOL_STAGE_ROOT/previous" -mindepth 1 -maxdepth 1 \
+        -mtime +"$SYSVOL_PREVIOUS_DAYS" -exec rm -rf {} + 2>/dev/null
+    return 0
+}
+
+# Validate a staged GPO tree before publication: GUID-shaped name, only
+# regular files and directories, a GPT.INI whose Version reaches MIN_VER.
+gpo_validate() {
+    local dir="$1" guid="$2" min_ver="$3" odd ver
+    [[ "$guid" =~ ^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$ ]] \
+        || { say "GPO $guid: not a GPO GUID; refusing"; return 1; }
+    [[ -d "$dir" && ! -L "$dir" ]] || { say "GPO $guid: staged tree missing"; return 1; }
+    odd=$(find "$dir" ! -type f ! -type d -print -quit 2>/dev/null)
+    [[ -z "$odd" ]] || { say "GPO $guid: staged tree holds a link or special file; refusing"; return 1; }
+    ver=$(read_local_gpt_version "$dir")
+    [[ "$ver" =~ ^[0-9]+$ ]] && (( ver > 0 && ver >= min_ver )) \
+        || { say "GPO $guid: staged GPT.INI version ${ver:-?} < v$min_ver; refusing"; return 1; }
+    return 0
+}
+
+# Move a detached tree into previous/<GUID>, replacing an older generation.
+_gpo_retain() {
+    local tree="$1" guid="$2" keep="$SYSVOL_STAGE_ROOT/previous/$2"
+    if [[ -e "$keep" ]]; then
+        rm -rf -- "$keep" || say "GPO $guid: could not delete an older detached generation"
+    fi
+    mv -T -- "$tree" "$keep" 2>/dev/null \
+        || say "GPO $guid: replaced tree left in $tree (retain failed)"
+    touch -- "$keep" 2>/dev/null || true
+}
+
+# Publish STAGED as Policies/GUID. Non-zero leaves the live tree untouched.
+gpo_publish() {
+    local policies="$1" guid="$2" staged="$3" live="$1/$2"
+    _gpo_fault before-exchange || return 1
+    if [[ ! -e "$live" ]]; then
+        mv -T -- "$staged" "$live" || return 1
+        return 0
+    fi
+    if ! gpo_exchange "$staged" "$live"; then
+        say "GPO $guid: atomic exchange unavailable or failed; live tree unchanged"
+        return 1
+    fi
+    # $staged now holds the replaced generation.
+    _gpo_fault after-exchange || say "GPO $guid: replaced tree left in $staged"
+    _gpo_retain "$staged" "$guid"
+    return 0
+}
+
+# Detach a live GPO tree (orphan) with one rename; it is kept in previous/.
+gpo_detach() {
+    local policies="$1" guid="$2" tmp
+    tmp="$SYSVOL_STAGE_ROOT/incoming/detach.$$"
+    mv -T -- "$policies/$guid" "$tmp" || return 1
+    _gpo_retain "$tmp" "$guid"
+}
+
+# Put the retained previous generation of GUID back in place.
+gpo_rollback() {
+    local policies="$1" guid="$2" keep="$SYSVOL_STAGE_ROOT/previous/$2"
+    [[ -d "$keep" ]] || { say "GPO $guid: no retained generation to roll back to"; return 1; }
+    if [[ -e "$policies/$guid" ]]; then
+        gpo_exchange "$keep" "$policies/$guid" || return 1
+    else
+        mv -T -- "$keep" "$policies/$guid" || return 1
+    fi
+    say "GPO $guid: previous generation restored"
+}
+# --- END gpo-publish ----------------------------------------------------------
+
 probe_reachable() {
     timeout 2 bash -c "exec 9<>/dev/tcp/$1/445" >/dev/null 2>&1
 }
@@ -836,6 +965,18 @@ done < <(
         END { if (cn != "" && ver != "") printf "%s\t%s\n", cn, ver }
     '
 )
+
+POLICIES_DIR="/var/lib/samba/sysvol/$REALM_LC/Policies"
+
+# --- --rollback mode: restore one retained generation --------------------------
+if [[ "$MODE" == "--rollback" ]]; then
+    gpo_rollback "$POLICIES_DIR" "$ROLLBACK_GUID" || exit 1
+    flock -u 200
+    systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1 \
+        || { say "ERROR: SYSVOL NTACL reset failed after rollback"; exit 1; }
+    say "rollback of $ROLLBACK_GUID complete"
+    exit 0
+fi
 
 # --- --status mode: print freshness table, no remote network calls -----------
 if [[ "$MODE" == "--status" ]]; then
@@ -951,21 +1092,27 @@ delete_count=0
 skip_count=0
 no_source_count=0
 any_pulled=0
+fail_count=0
 
-# Orphan cleanup: local GPO dirs with no matching AD object.
-if [[ -d "/var/lib/samba/sysvol/$REALM_LC/Policies" ]]; then
-    for d in "/var/lib/samba/sysvol/$REALM_LC/Policies/"*/; do
-        [[ -d "$d" ]] || continue
-        bn=$(basename "$d")
-        [[ "$bn" =~ ^\{.*\}$ ]] || continue
-        if [[ -z "${target_versions[$bn]+set}" ]]; then
-            say "delete orphan: $bn (no AD object)"
-            rm -rf "$d"
+gpo_stage_ready "$POLICIES_DIR" || fatal "SYSVOL staging area unavailable; nothing published"
+
+# Orphan cleanup: local GPO dirs with no matching AD object are detached with
+# one rename (kept in previous/ for --rollback), never deleted in place.
+for d in "$POLICIES_DIR/"*/; do
+    [[ -d "$d" ]] || continue
+    bn=$(basename "$d")
+    [[ "$bn" =~ ^\{.*\}$ ]] || continue
+    if [[ -z "${target_versions[$bn]+set}" ]]; then
+        if gpo_detach "$POLICIES_DIR" "$bn"; then
+            say "detached orphan: $bn (no AD object)"
             delete_count=$((delete_count + 1))
             any_pulled=1
+        else
+            say "orphan $bn: detach failed; left in place"
+            fail_count=$((fail_count + 1))
         fi
-    done
-fi
+    fi
+done
 
 for guid in "${!target_versions[@]}"; do
     target_ver="${target_versions[$guid]}"
@@ -1004,22 +1151,24 @@ for guid in "${!target_versions[@]}"; do
         continue
     fi
 
-    # Stage-then-swap: never leave the live tree half-written.
+    # Download into a staging directory on the SYSVOL filesystem, validate,
+    # then publish with one rename or one atomic exchange (see gpo-publish).
     # smbclient mget needs to be `cd <parent>; mget <name>` — passing a
     # path-with-slashes to mget directly produces a silent rc=0 with no
     # files. Use the `cd` form, which mirrors the directory tree under
-    # $stage/<guid>/, then rsync that into place.
-    stage=$(mktemp -d /tmp/sysvol-stage.XXXXXX)
+    # $stage/<guid>/. Any NT_STATUS error in its output means an incomplete
+    # download, even when smbclient exits 0.
+    stage=$(mktemp -d "$SYSVOL_STAGE_ROOT/incoming/run.XXXXXX")
+    mget_log="$stage.log"
     if smbclient "//${chosen_fqdn}/sysvol" -P --quiet \
             -c "recurse ON; prompt OFF; cd $REALM_LC/Policies; lcd $stage; mget $guid" \
-            >>"$LOGFILE" 2>&1 \
-        && [[ -d "$stage/$guid" ]]; then
-
-        dst="/var/lib/samba/sysvol/$REALM_LC/Policies/$guid"
-        mkdir -p "$dst"
-        if rsync -a --delete --max-delete=100 \
-                "$stage/$guid/" "$dst/" >>"$LOGFILE" 2>&1; then
-            say "GPO $guid: pulled v$local_ver -> v$chosen_ver from $chosen_fqdn"
+            >"$mget_log" 2>&1 \
+        && ! grep -q 'NT_STATUS_' "$mget_log" \
+        && [[ -d "$stage/$guid" ]] \
+        && _gpo_fault after-download \
+        && gpo_validate "$stage/$guid" "$guid" "$target_ver"; then
+        if gpo_publish "$POLICIES_DIR" "$guid" "$stage/$guid"; then
+            say "GPO $guid: published v$local_ver -> v$chosen_ver from $chosen_fqdn"
             if [[ "$local_ver" -eq 0 ]]; then
                 new_count=$((new_count + 1))
             else
@@ -1027,12 +1176,15 @@ for guid in "${!target_versions[@]}"; do
             fi
             any_pulled=1
         else
-            say "GPO $guid: local rsync into $dst failed"
+            say "GPO $guid: publication failed; v$local_ver stays live"
+            fail_count=$((fail_count + 1))
         fi
     else
-        say "GPO $guid: smbclient mget from $chosen_fqdn failed (no $stage/$guid produced)"
+        say "GPO $guid: download from $chosen_fqdn incomplete or invalid; v$local_ver stays live"
+        fail_count=$((fail_count + 1))
     fi
-    rm -rf "$stage"
+    cat "$mget_log" >>"$LOGFILE" 2>/dev/null
+    rm -rf -- "$stage" "$mget_log"
 done
 
 # A single whole-tree reset at the end is cheaper than per-GPO walks and
@@ -1053,7 +1205,7 @@ if [[ $any_pulled -eq 1 ]]; then
     fi
 fi
 
-say "done: new=$new_count updated=$update_count deleted=$delete_count current=$skip_count no-source=$no_source_count"
+say "done: new=$new_count updated=$update_count deleted=$delete_count current=$skip_count no-source=$no_source_count failed=$fail_count"
 SYNCEOF
 chmod +x /usr/local/sbin/sysvol-sync
 

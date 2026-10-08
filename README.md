@@ -293,6 +293,16 @@ caveat live in [`docs/RELEASE.md`](docs/RELEASE.md).
   inspect `samba-sconfig sysvol-acl-status` and
   `/var/log/samba/sysvol-acl-reset.log`. A failed reset makes the join report a
   partial failure instead of being silently ignored.
+- `sysvol-sync` publishes each GPO atomically. A download is staged in
+  `/var/lib/samba/sysvol-sync/incoming` (same filesystem as SYSVOL),
+  validated (GUID name, regular files and directories only, `GPT.INI`
+  version), then published with one rename (new GPO) or one
+  `renameat2(RENAME_EXCHANGE)` (existing GPO). Clients see the whole old or
+  the whole new GPO. If the exchange is unavailable or fails, the old GPO
+  stays live. The replaced tree, and any orphan GPO removed because AD no
+  longer has it, is kept in `/var/lib/samba/sysvol-sync/previous/<GUID>`
+  for 30 days; `sysvol-sync --rollback '<GUID>'` puts it back and resets
+  NTACLs.
 - Existing domain-based DFS namespace roots are protected automatically
   during provision or join. The DC reads replicated root-target metadata,
   creates managed `msdfs proxy` shares, excludes itself to prevent referral
