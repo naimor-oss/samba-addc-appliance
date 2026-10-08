@@ -23,6 +23,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Workstation portability (WSL2 on Windows 11, or macOS): ISO share path,
+# seed ISO builder, checksums. lab-kit is a sibling checkout.
+LAB_KIT_DIR="${LAB_KIT_DIR:-$SCRIPT_DIR/../../lab-kit}"
+# shellcheck disable=SC1091
+source "$LAB_KIT_DIR/lib/lab-host.sh" 2>/dev/null \
+    || { echo "error: lab-kit not found at $LAB_KIT_DIR (clone it next to this repo)" >&2; exit 1; }
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 APPCORE_REPO="${APPCORE_REPO:-$REPO_DIR/../appliance-core}"
 
@@ -33,9 +39,10 @@ VM_IP="${VM_IP:-10.10.10.20}"
 VM_USER="${VM_USER:-debadmin}"
 HV_HOST="${HV_HOST:-server}"
 HV_USER="${HV_USER:-nmadmin}"
-STAGE_DIR_MAC="${LAB_STAGE_DIR:-/Volumes/ISO/lab-scripts}"
+# Workstation view of D:\ISO (the *_MAC names are kept for compatibility).
+STAGE_DIR_MAC="${LAB_STAGE_DIR:-$(lab_iso_dir)/lab-scripts}"
 STAGE_DIR_HOST="${LAB_HOST_STAGE_DIR:-D:\\ISO\\lab-scripts}"
-ISO_DIR_MAC="${ISO_DIR_MAC:-/Volumes/ISO}"
+ISO_DIR_MAC="${ISO_DIR_MAC:-$(lab_iso_dir)}"
 DOMAIN="${DOMAIN:-lab.test}"
 # Empty by default so the stager picks up lab/keys/*.pub (the
 # documented multi-key path). Operators can still pin a single key

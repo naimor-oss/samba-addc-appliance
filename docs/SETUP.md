@@ -6,6 +6,13 @@ tooling, Hyper-V host, external artifacts, and the sibling-repo layout.
 After finishing this guide, follow the "First-Time Lab Setup" section
 in the main [README](../README.md) to actually build the lab VMs.
 
+> **Workstation (2026-10):** the supported workstation is Windows 11 with
+> WSL2 and Hyper-V. Set it up with
+> [`../../dev-commons/WSL2-LAB-SETUP.md`](../../dev-commons/WSL2-LAB-SETUP.md);
+> the lab scripts pick the ISO share path, seed-ISO builder and checksum
+> tool through `lab-kit/lib/lab-host.sh` (`/mnt/d/ISO` on WSL2). The
+> macOS instructions below still describe the legacy Mac workflow.
+
 ## Overview
 
 The lab is driven from a Mac and runs on a remote Hyper-V host. Three
