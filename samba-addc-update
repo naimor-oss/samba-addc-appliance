@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# samba-addc-update — the appliance's built-in updater (appliance-core update
+# framework, docs/lib-update.md in appliance-core).
+#
+#   samba-addc-update status | history
+#   samba-addc-update apply samba-addc-update-X.Y.Z.tar.gz [--reinstall]
+#   samba-addc-update rollback [BACKUP_DIR]
+set -u
+LIB=/usr/local/lib/appliance-core
+# shellcheck disable=SC1091
+source "$LIB/kvstate.sh" 2>/dev/null && source "$LIB/update.sh" 2>/dev/null \
+    || { echo "samba-addc-update: appliance-core update library missing in $LIB" >&2; exit 2; }
+appcore_update_cli samba-addc "$@"
