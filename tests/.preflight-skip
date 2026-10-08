@@ -1,0 +1,5 @@
+# Files preflight leaves out. One path per line, relative to tests/.
+# These drive real dialog/whiptail screens in a PTY (or Docker); CI runs
+# them in its container job instead.
+run-tui-inputbox-harness.sh  # needs dialog+whiptail+tmux or Docker
+tui-inputbox-harness.sh      # invoked by run-tui-inputbox-harness.sh
