@@ -192,7 +192,7 @@ step "5. push appliance scripts and appliance-core lib/ to the VM"
 scp -J "${HV_USER}@${HV_HOST}" \
     -o IdentitiesOnly=yes -o IdentityAgent=none \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    "$REPO_DIR/prepare-image.sh" "$REPO_DIR/samba-sconfig.sh" \
+    "$REPO_DIR/prepare-image.sh" "$REPO_DIR/samba-sconfig.sh" "$REPO_DIR/samba-addc-update" \
     "${VM_USER}@${VM_IP}:/tmp/"
 
 # Cross-repo: vendor the shared libs from the sibling appliance-core
@@ -213,7 +213,9 @@ scp -J "${HV_USER}@${HV_HOST}" -r \
 step "6. run prepare-image.sh on $VM_NAME"
 # The appliance has no git, so source identities must cross the build
 # boundary explicitly.
-if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' SAMBA_BUILD_COMMIT='$SAMBA_BUILD_COMMIT' SOURCE_TREE_STATE=clean bash /tmp/prepare-image.sh"; then
+SAMBA_APPLIANCE_VERSION="$(head -1 "$REPO_DIR/VERSION")"
+say "  samba-addc appliance version: $SAMBA_APPLIANCE_VERSION"
+if ! ssh_vm "sudo APPCORE_BUILD_COMMIT='$APPCORE_BUILD_COMMIT' SAMBA_BUILD_COMMIT='$SAMBA_BUILD_COMMIT' SAMBA_APPLIANCE_VERSION='$SAMBA_APPLIANCE_VERSION' SOURCE_TREE_STATE=clean bash /tmp/prepare-image.sh"; then
     say "prepare-image.sh failed"
     ssh_vm 'sudo tail -30 /var/log/samba-prepare.log 2>/dev/null || journalctl -n 30 --no-pager'
     exit 1

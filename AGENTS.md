@@ -117,6 +117,9 @@ lab/run-scenario.sh join-dc --verify-only
 ```bash
 bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 bash tests/sysvol-publish.sh
+# root-only, in a throwaway container (CI runs it):
+docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
+    debian:trixie bash /ws/samba-addc-appliance/tests/root/update-bundle.sh
 ```
 
 ## Development Rules
@@ -151,6 +154,19 @@ bash tests/sysvol-publish.sh
   login banner reads single keys with `awk` and keeps only host-name
   characters. `tests/settings-state.bats` enforces this (code-review
   session plan 05).
+
+## Release identity and updates
+
+`/etc/samba-addc.release` (written by `prepare-image.sh` after the final
+package upgrade, rewritten by every update) records the version
+(`VERSION`), repo commit, appliance-core and Samba versions, applied
+migrations and history. Every change to the appliance's scripts after
+imaging ships as a bundle built by `updates/build-bundle.sh` and applied by
+`samba-addc-update` (appliance-core update framework; DC hooks in
+`updates/bundle/`). Bump `VERSION`, add the previous version to
+`updates/bundle/ACCEPTS`, and add a migration in `updates/bundle/migrations/`
+when settings must change. `tests/root/update-bundle.sh` applies the real
+bundle to a simulated field DC.
 
 ## Important Samba Interop Notes
 

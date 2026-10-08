@@ -504,8 +504,8 @@ if [[ -n "$LIB_SRC" ]]; then
     done
     # Every settings reader on the appliance depends on kvstate.sh
     # (code-review session plan 05); an image without it fails closed.
-    [[ -f "$LIB_TARGET/kvstate.sh" ]] || {
-        err "appliance-core lib has no kvstate.sh; build from appliance-core >= 0.12.0"
+    [[ -f "$LIB_TARGET/kvstate.sh" && -f "$LIB_TARGET/update.sh" ]] || {
+        err "appliance-core lib lacks kvstate.sh/update.sh; build from appliance-core >= 0.13.0"
         exit 1
     }
     log "  vendored $dst_count appliance-core lib(s) into $LIB_TARGET"
@@ -2436,6 +2436,37 @@ chmod +x /etc/update-motd.d/15-samba-net-status
 log "Applying final package updates..."
 apt-get update -y
 apt-get full-upgrade -y
+
+# Release identity and the built-in updater (audit M1/M2). Written after the
+# final upgrade so the recorded Samba version is the one the image ships.
+log "Installing samba-addc-update and writing /etc/samba-addc.release..."
+for src in /tmp/samba-addc-update /root/samba-addc-update; do
+    if [[ -f "$src" ]]; then
+        install -m 0755 "$src" /usr/local/sbin/samba-addc-update
+        break
+    fi
+done
+[[ -x /usr/local/sbin/samba-addc-update ]] || { err "samba-addc-update not found in /tmp"; exit 1; }
+[[ "${SAMBA_APPLIANCE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] \
+    || { err "SAMBA_APPLIANCE_VERSION is not set (lab/build-fresh-base.sh passes it from VERSION)"; exit 1; }
+(
+    # shellcheck disable=SC1091
+    source "$LIB_TARGET/kvstate.sh" && source "$LIB_TARGET/update.sh" || exit 1
+    built=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    REL_APPLIANCE=samba-addc
+    REL_VERSION="$SAMBA_APPLIANCE_VERSION"
+    REL_REPO_COMMIT="${SAMBA_BUILD_COMMIT:-unknown}"
+    REL_APPCORE_VERSION=$(head -1 "$LIB_TARGET/VERSION" 2>/dev/null || echo unknown)
+    REL_APPCORE_COMMIT="${APPCORE_BUILD_COMMIT:-unknown}"
+    REL_SAMBA_VERSION=$(dpkg-query -W -f='${Version}' samba 2>/dev/null || true)
+    REL_VFS_VERSION=""
+    REL_IMAGE_BUILT_AT="$built"
+    REL_LAST_UPDATE_AT=""
+    REL_MIGRATIONS=""
+    REL_HISTORY="${SAMBA_APPLIANCE_VERSION}@${built}"
+    appcore_release_write /etc/samba-addc.release
+) || { err "could not write /etc/samba-addc.release"; exit 1; }
+log "  $(grep -E '^(VERSION|SAMBA_VERSION)=' /etc/samba-addc.release | tr '\n' ' ')"
 
 # The lab seed necessarily gives the build VM a routable FQDN. That identity
 # must not survive in the deploy master: it would otherwise become a false
