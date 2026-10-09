@@ -1812,12 +1812,21 @@ load_detect_env() {
     DET_PTR_FQDN="" DET_PTR_NAME="" DET_PTR_DOMAIN=""
     DET_EFFECTIVE_DOMAIN="" DET_AD_DC="" DET_AD_REALM=""
     SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""
-    # Parsed as data, never sourced (code-review session plan 05).
+    # Parsed as data, never sourced (code-review session plan 05). kvstate
+    # refuses unknown keys, so the library's own key list must be passed:
+    # a key the library adds later would otherwise make the whole file fail.
     if [[ -f "$DETECT_FILE" ]] && declare -F appcore_kv_load >/dev/null; then
-        appcore_kv_load "$DETECT_FILE" APPCORE_DET_IP APPCORE_DET_GATEWAY \
-            APPCORE_DET_DHCP_DNS APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN \
-            APPCORE_DET_PTR_NAME APPCORE_DET_PTR_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN \
-            APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE SAMBA_DET_AD_DC SAMBA_DET_AD_REALM \
+        if declare -p APPCORE_DET_CACHE_KEYS >/dev/null 2>&1; then
+            DET_LIB_KEYS=("${APPCORE_DET_CACHE_KEYS[@]}")
+        else
+            # Libraries older than 0.14.0 do not export the list: use the full set.
+            DET_LIB_KEYS=(APPCORE_DET_IFACE APPCORE_DET_IP APPCORE_DET_GATEWAY
+                APPCORE_DET_DHCP_DNS APPCORE_DET_DHCP_DOMAIN APPCORE_DET_PTR_FQDN
+                APPCORE_DET_PTR_NAME APPCORE_DET_PTR_DOMAIN
+                APPCORE_DET_EFFECTIVE_DOMAIN APPCORE_DET_EFFECTIVE_DOMAIN_SOURCE)
+        fi
+        appcore_kv_load "$DETECT_FILE" "${DET_LIB_KEYS[@]}" \
+            SAMBA_DET_AD_DC SAMBA_DET_AD_REALM \
             2>/dev/null || { SAMBA_DET_AD_DC="" SAMBA_DET_AD_REALM=""; }
     fi
     if command -v appcore_detect_net_init >/dev/null 2>&1; then
