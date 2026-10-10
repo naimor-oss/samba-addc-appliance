@@ -149,26 +149,26 @@ also re-stages from all three sources automatically on every run.
 Run on the Hyper-V host through SSH:
 
 ```bash
-ssh nmadmin@server 'pwsh -File D:\ISO\lab-scripts\New-LabRouter.ps1'
+ssh labadmin@server 'pwsh -File D:\ISO\lab-scripts\New-LabRouter.ps1'
 ```
 
 Verify from the Mac:
 
 ```bash
-ssh -J nmadmin@server hm@10.10.10.1 'cat /var/log/router-ready.marker; sudo nft list table ip nat'
+ssh -J labadmin@server labadmin@10.10.10.1 'cat /var/log/router-ready.marker; sudo nft list table ip nat'
 ```
 
 ### 4. Build the WS2025 domain controller
 
 ```bash
-ssh nmadmin@server 'pwsh -File D:\ISO\lab-scripts\New-WS2025Lab.ps1'
+ssh labadmin@server 'pwsh -File D:\ISO\lab-scripts\New-WS2025Lab.ps1'
 ```
 
 Wait until promotion and phase 2 complete. You can poll the completion
 marker from the host:
 
 ```bash
-ssh nmadmin@server 'pwsh -Command "Invoke-Command -VMName WS2025-DC1 -Credential (Get-Credential LAB\\Administrator) -ScriptBlock { Test-Path C:\\Setup\\setup-complete.marker }"'
+ssh labadmin@server 'pwsh -Command "Invoke-Command -VMName WS2025-DC1 -Credential (Get-Credential LAB\\Administrator) -ScriptBlock { Test-Path C:\\Setup\\setup-complete.marker }"'
 ```
 
 `FirstLogon-PromoteToDC.ps1` registers a RunOnce that completes phase 2
@@ -178,7 +178,7 @@ needed beyond waiting.
 Then apply the Microsoft baseline:
 
 ```bash
-ssh nmadmin@server 'pwsh -File D:\ISO\lab-scripts\Apply-SecurityBaseline.ps1'
+ssh labadmin@server 'pwsh -File D:\ISO\lab-scripts\Apply-SecurityBaseline.ps1'
 ```
 
 ### 5. Build the Samba appliance image
@@ -222,7 +222,7 @@ Under the hood:
 Verify reachability after the build:
 
 ```bash
-ssh -J nmadmin@server debadmin@10.10.10.20 'sudo -n true && echo OK'
+ssh -J labadmin@server debadmin@10.10.10.20 'sudo -n true && echo OK'
 ```
 
 When deployed elsewhere, the appliance presents a console-side text

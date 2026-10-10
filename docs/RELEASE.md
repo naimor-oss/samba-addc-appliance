@@ -23,7 +23,7 @@ All four files are independently usable; you do not need them all to deploy.
 
 ### Prerequisites on the build operator's Mac
 
-- Hyper-V host reachable over SSH as `nmadmin@server` (per `samba.env`).
+- Hyper-V host reachable over SSH as `labadmin@server` (per `samba.env`).
 - `qemu-img` from `brew install qemu`.
 - `ovftool` at `/Volumes/Data/Developer/Debian-SAMBA/ovftool/ovftool`
   (override with `OVFTOOL=...`). macOS Gatekeeper may refuse a couple of

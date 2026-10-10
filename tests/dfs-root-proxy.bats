@@ -12,13 +12,13 @@ setup() {
 
     cat > "$SAMBA_SMB_CONF" <<'EOF'
 [global]
-    realm = NAIMOR.NAIMORINC.COM
+    realm = CORP.EXAMPLE.COM
 
 [sysvol]
     path = /var/lib/samba/sysvol
 
 [netlogon]
-    path = /var/lib/samba/sysvol/naimor.naimorinc.com/scripts
+    path = /var/lib/samba/sysvol/corp.example.com/scripts
 EOF
 
     source "${BATS_TEST_DIRNAME}/../samba-sconfig.sh"
@@ -38,7 +38,7 @@ ldbsearch() {
 hostname() {
     case "${1:-}" in
         -s) printf '%s\n' 'mal-dc2' ;;
-        -f) printf '%s\n' 'mal-dc2.naimor.naimorinc.com' ;;
+        -f) printf '%s\n' 'mal-dc2.corp.example.com' ;;
         *)  printf '%s\n' 'mal-dc2' ;;
     esac
 }
@@ -59,22 +59,22 @@ mock_dfs_render_targets() {
     case "$1" in
         ROOT_CNC)
             printf '%s\n' \
-                $'siteCostNormal\t10\tonline\t\\\\SERVER.naimor.naimorinc.com\\CNCFiles' \
-                $'siteCostNormal\t0\tonline\t\\\\FILES.naimor.naimorinc.com\\CNCFiles' \
-                $'globalLow\t0\tonline\t\\\\mal-dc2.naimor.naimorinc.com\\CNCFiles'
+                $'siteCostNormal\t10\tonline\t\\\\SERVER.corp.example.com\\CNCFiles' \
+                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\CNCFiles' \
+                $'globalLow\t0\tonline\t\\\\mal-dc2.corp.example.com\\CNCFiles'
             ;;
         ROOT_PF)
             printf '%s\n' \
-                $'siteCostNormal\t0\tonline\t\\\\FILES.naimor.naimorinc.com\\PF$' \
-                $'siteCostNormal\t0\toffline\t\\\\OLD.naimor.naimorinc.com\\PF$'
+                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\PF$' \
+                $'siteCostNormal\t0\toffline\t\\\\OLD.corp.example.com\\PF$'
             ;;
         ROOT_SHARED)
             printf '%s\n' \
-                $'siteCostNormal\t0\tonline\t\\\\FILES.naimor.naimorinc.com\\Shared'
+                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\Shared'
             ;;
         ROOT_BAD)
             printf '%s\n' \
-                $'siteCostNormal\t0\tonline\t\\\\FILES.naimor.naimorinc.com\\Shared\\extra'
+                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\Shared\\extra'
             ;;
         *) return 3 ;;
     esac
@@ -83,7 +83,7 @@ mock_dfs_render_targets() {
 write_v1_root_record() {
     local name="$1" target="$2"
     cat >> "$LDB_FIXTURE" <<EOF
-dn: CN=${name},CN=Dfs-Configuration,CN=System,DC=naimor,DC=naimorinc,DC=com
+dn: CN=${name},CN=Dfs-Configuration,CN=System,DC=corp,DC=example,DC=com
 objectClass: fTDfs
 name: ${name}
 remoteServerName: ${target}
@@ -95,7 +95,7 @@ EOF
 write_root_record() {
     local name="$1" blob="$2"
     cat >> "$LDB_FIXTURE" <<EOF
-dn: CN=${name},CN=${name},CN=Dfs-Configuration,CN=System,DC=naimor,DC=naimorinc,DC=com
+dn: CN=${name},CN=${name},CN=Dfs-Configuration,CN=System,DC=corp,DC=example,DC=com
 cn: ${name}
 msDFS-TargetListv2:: ${blob}
 
@@ -112,11 +112,11 @@ EOF
     [ "$status" -eq 0 ]
     grep -Fq '[CNCFiles]' "$SAMBA_SMB_CONF"
     grep -Fq '    msdfs root = yes' "$SAMBA_SMB_CONF"
-    grep -Fq '    msdfs proxy = \FILES.naimor.naimorinc.com\CNCFiles,\SERVER.naimor.naimorinc.com\CNCFiles' "$SAMBA_SMB_CONF"
+    grep -Fq '    msdfs proxy = \FILES.corp.example.com\CNCFiles,\SERVER.corp.example.com\CNCFiles' "$SAMBA_SMB_CONF"
     grep -Fq '[PF$]' "$SAMBA_SMB_CONF"
-    grep -Fq '    msdfs proxy = \FILES.naimor.naimorinc.com\PF$' "$SAMBA_SMB_CONF"
-    ! grep -Fq 'mal-dc2.naimor.naimorinc.com' "$SAMBA_SMB_CONF"
-    ! grep -Fq 'OLD.naimor.naimorinc.com' "$SAMBA_SMB_CONF"
+    grep -Fq '    msdfs proxy = \FILES.corp.example.com\PF$' "$SAMBA_SMB_CONF"
+    ! grep -Fq 'mal-dc2.corp.example.com' "$SAMBA_SMB_CONF"
+    ! grep -Fq 'OLD.corp.example.com' "$SAMBA_SMB_CONF"
     [ "$(grep -Fc "$DFS_ROOT_PROXY_BEGIN" "$SAMBA_SMB_CONF")" -eq 1 ]
     grep -Fq 'smbcontrol all reload-config' "$CALL_LOG"
 }
@@ -142,7 +142,7 @@ EOF
 ${DFS_ROOT_PROXY_BEGIN}
 [Existing]
     msdfs root = yes
-    msdfs proxy = \FILES.naimor.naimorinc.com\Existing
+    msdfs proxy = \FILES.corp.example.com\Existing
 ${DFS_ROOT_PROXY_END}
 EOF
     cp "$SAMBA_SMB_CONF" "${SAMBA_SMB_CONF}.before"
@@ -197,7 +197,7 @@ EOF
 ${DFS_ROOT_PROXY_BEGIN}
 [OldRoot]
     msdfs root = yes
-    msdfs proxy = \FILES.naimor.naimorinc.com\OldRoot
+    msdfs proxy = \FILES.corp.example.com\OldRoot
 ${DFS_ROOT_PROXY_END}
 EOF
     : > "$LDB_FIXTURE"
@@ -212,13 +212,13 @@ EOF
 
 @test "legacy domain-v1 roots are proxied from remoteServerName targets" {
     : > "$LDB_FIXTURE"
-    write_v1_root_record Legacy '\\FILES.naimor.naimorinc.com\Legacy'
+    write_v1_root_record Legacy '\\FILES.corp.example.com\Legacy'
 
     run _dfs_sync_domain_root_proxies
 
     [ "$status" -eq 0 ]
     grep -Fq '[Legacy]' "$SAMBA_SMB_CONF"
-    grep -Fq '    msdfs proxy = \FILES.naimor.naimorinc.com\Legacy' "$SAMBA_SMB_CONF"
+    grep -Fq '    msdfs proxy = \FILES.corp.example.com\Legacy' "$SAMBA_SMB_CONF"
 }
 
 @test "zero domain roots do not reformat an untouched smb.conf" {
@@ -252,7 +252,7 @@ EOF
         return 0
     }
 
-    run _dfs_validate_target_unc '\\FILES.naimor.naimorinc.com\Shared\extra'
+    run _dfs_validate_target_unc '\\FILES.corp.example.com\Shared\extra'
 
     [ "$status" -ne 0 ]
 }

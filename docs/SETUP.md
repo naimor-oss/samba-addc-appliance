@@ -149,9 +149,9 @@ this layout.
 
 ```bash
 mkdir -p ~/src/Debian-SAMBA && cd ~/src/Debian-SAMBA
-git clone https://github.com/hooman/lab-kit.git
-git clone https://github.com/hooman/lab-router.git
-git clone https://github.com/hooman/samba-addc-appliance.git
+git clone https://github.com/naimor-oss/lab-kit.git
+git clone https://github.com/naimor-oss/lab-router.git
+git clone https://github.com/naimor-oss/samba-addc-appliance.git
 ```
 
 Verify:
@@ -168,7 +168,7 @@ If your setup differs, these are the touch points:
 | Setting | Default | Change in |
 | --- | --- | --- |
 | Hyper-V host DNS name | `server` | `samba-addc-appliance/lab/samba.env` (`LAB_HV_HOST`) |
-| Host SSH user | `nmadmin` | `samba-addc-appliance/lab/samba.env` (`LAB_HV_USER`) |
+| Host SSH user | `labadmin` | `samba-addc-appliance/lab/samba.env` (`LAB_HV_USER`) |
 | Mac-side ISO share path | `/Volumes/ISO/lab-scripts` | `samba-addc-appliance/lab/samba.env` (`LAB_STAGE_DIR`) |
 | Host-side ISO share path | `D:\ISO\lab-scripts` | `samba-addc-appliance/lab/samba.env` (`LAB_HOST_STAGE_DIR`) |
 | VM admin user on Samba VM | `debadmin` | `samba.env` (`LAB_VM_USER`) and manual install |
@@ -201,8 +201,8 @@ command -v yq >/dev/null && echo "yq OK (YAML config supported)" || echo "yq mis
 # 4. SSH keypair.
 [[ -f ~/.ssh/id_ed25519.pub ]] && echo "ssh key OK"
 
-# 5. SSH to the Hyper-V host with pwsh. Replace nmadmin@server if yours differs.
-ssh nmadmin@server 'pwsh -Command "(Get-VMSwitch | Where-Object SwitchType -eq \"External\").Name"'
+# 5. SSH to the Hyper-V host with pwsh. Replace labadmin@server if yours differs.
+ssh labadmin@server 'pwsh -Command "(Get-VMSwitch | Where-Object SwitchType -eq \"External\").Name"'
 
 # 6. ISO share is mounted and writable.
 touch /Volumes/ISO/.write-test && rm /Volumes/ISO/.write-test && echo "ISO share OK"
