@@ -90,7 +90,7 @@ yesno() {
 # backslashes (DOMAIN\Group, UNC paths, captured wbinfo / samba-tool
 # output). Delegates to appcore_tui_show_text which uses --textbox
 # under the hood and reads the body file BYTE-for-BYTE, so a body
-# like 'NAIMOR\administrator' doesn't get mangled by whiptail's
+# like 'EXAMPLE\administrator' doesn't get mangled by whiptail's
 # --msgbox C-escape interpretation (`\a` → BEL, `\g` → ?, etc.).
 # Fallback path doubles `\` so single-backslash content still
 # renders correctly via --msgbox on older images without the lib.
@@ -1017,7 +1017,7 @@ DNSEOF
     # the stale realm the appliance was bound to before the operator
     # set up Samba (e.g. lab.test from the build-time DHCP search
     # domain, kept around after the operator joined a real production
-    # realm like naimor.naimorinc.com). Delegated to appliance-core's
+    # realm like corp.example.com). Delegated to appliance-core's
     # hostname lib so the rewrite logic + safe sed pattern + multi-NIC
     # IP selection all live in one tested place.
     if command -v appcore_hostname_align_to_realm >/dev/null 2>&1; then
@@ -1458,7 +1458,7 @@ setup_domain_logins() {
 
     # info_text (not info) is required here — the body embeds
     # `wbinfo -u` output which contains literal `\` characters
-    # (NAIMOR\administrator etc.). info() routes via --msgbox which
+    # (EXAMPLE\administrator etc.). info() routes via --msgbox which
     # interprets `\a`, `\g` etc. as C-escapes and mangles the
     # display.
     local test_output
@@ -1488,7 +1488,7 @@ setup_domain_sudo() {
     #       confuses sudo's parser.
     #   (2) When the operator worked around that by typing "Domain\
     #       Admins", the backslash-escape leaked into the displayed
-    #       confirmation as "NAIMOR\\Domain\ Admins".
+    #       confirmation as "EXAMPLE\\Domain\ Admins".
     # Both bugs go away when input parsing and per-context formatting
     # come from appliance-core's identity.sh primitives. The operator
     # can type any of the accepted forms; we canonicalize once and

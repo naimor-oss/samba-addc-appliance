@@ -7,7 +7,7 @@
         <mxCell id="title" value="Samba AD DC Appliance — Lab v2 topology" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=16;fontStyle=1" vertex="1" parent="1">
           <mxGeometry x="350" y="5" width="500" height="30" as="geometry"/>
         </mxCell>
-        <mxCell id="mac" value="&lt;b&gt;Mac&lt;/b&gt; (Claude Code operator)&#10;~/.ssh/id_ed25519 → nmadmin@server&#10;                          → hm@10.10.10.1 (jump)&#10;                          → debadmin@10.10.10.20 (jump)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;verticalAlign=middle" vertex="1" parent="1">
+        <mxCell id="mac" value="&lt;b&gt;Mac&lt;/b&gt; (Claude Code operator)&#10;~/.ssh/id_ed25519 → labadmin@server&#10;                          → labadmin@10.10.10.1 (jump)&#10;                          → debadmin@10.10.10.20 (jump)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;align=center;verticalAlign=middle" vertex="1" parent="1">
           <mxGeometry x="470" y="40" width="320" height="80" as="geometry"/>
         </mxCell>
         <mxCell id="internet" value="&lt;b&gt;Internet&lt;/b&gt;" style="shape=cloud;whiteSpace=wrap;html=1;fillColor=#eeeeee;strokeColor=#666666;fontSize=11" vertex="1" parent="1">
@@ -34,13 +34,13 @@
         <mxCell id="arrNet" value="Internet" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10" edge="1" parent="1" source="internet" target="extsw">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="arrMH" value="ssh nmadmin@server&#10;(key-based, PowerShell 7.6)" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10" edge="1" parent="1" source="mac" target="host">
+        <mxCell id="arrMH" value="ssh labadmin@server&#10;(key-based, PowerShell 7.6)" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10" edge="1" parent="1" source="mac" target="host">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="arrMR" value="ssh -J nmadmin@server hm@10.10.10.1" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10;dashed=1;strokeColor=#0066cc;strokeWidth=1.5" edge="1" parent="1" source="mac" target="router">
+        <mxCell id="arrMR" value="ssh -J labadmin@server labadmin@10.10.10.1" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10;dashed=1;strokeColor=#0066cc;strokeWidth=1.5" edge="1" parent="1" source="mac" target="router">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="arrMS" value="ssh -J nmadmin@server debadmin@10.10.10.20" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10;dashed=1;strokeColor=#0066cc;strokeWidth=1.5" edge="1" parent="1" source="mac" target="sambadc">
+        <mxCell id="arrMS" value="ssh -J labadmin@server debadmin@10.10.10.20" style="endArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10;dashed=1;strokeColor=#0066cc;strokeWidth=1.5" edge="1" parent="1" source="mac" target="sambadc">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
         <mxCell id="arrRouterExt" value="WAN (eth0)&#10;DHCP" style="endArrow=classic;startArrow=classic;html=1;labelBackgroundColor=#ffffff;fontSize=10" edge="1" parent="1" source="router" target="extsw">
