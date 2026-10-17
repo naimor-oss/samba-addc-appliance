@@ -37,9 +37,9 @@ ldbsearch() {
 
 hostname() {
     case "${1:-}" in
-        -s) printf '%s\n' 'mal-dc2' ;;
-        -f) printf '%s\n' 'mal-dc2.corp.example.com' ;;
-        *)  printf '%s\n' 'mal-dc2' ;;
+        -s) printf '%s\n' 'dc2' ;;
+        -f) printf '%s\n' 'dc2.corp.example.com' ;;
+        *)  printf '%s\n' 'dc2' ;;
     esac
 }
 
@@ -59,9 +59,9 @@ mock_dfs_render_targets() {
     case "$1" in
         ROOT_CNC)
             printf '%s\n' \
-                $'siteCostNormal\t10\tonline\t\\\\SERVER.corp.example.com\\CNCFiles' \
-                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\CNCFiles' \
-                $'globalLow\t0\tonline\t\\\\mal-dc2.corp.example.com\\CNCFiles'
+                $'siteCostNormal\t10\tonline\t\\\\SERVER.corp.example.com\\Files' \
+                $'siteCostNormal\t0\tonline\t\\\\FILES.corp.example.com\\Files' \
+                $'globalLow\t0\tonline\t\\\\dc2.corp.example.com\\Files'
             ;;
         ROOT_PF)
             printf '%s\n' \
@@ -104,18 +104,18 @@ EOF
 
 @test "domain root sync creates proxy shares and excludes offline and local targets" {
     : > "$LDB_FIXTURE"
-    write_root_record CNCFiles ROOT_CNC
+    write_root_record Files ROOT_CNC
     write_root_record 'PF$' ROOT_PF
 
     run _dfs_sync_domain_root_proxies
 
     [ "$status" -eq 0 ]
-    grep -Fq '[CNCFiles]' "$SAMBA_SMB_CONF"
+    grep -Fq '[Files]' "$SAMBA_SMB_CONF"
     grep -Fq '    msdfs root = yes' "$SAMBA_SMB_CONF"
-    grep -Fq '    msdfs proxy = \FILES.corp.example.com\CNCFiles,\SERVER.corp.example.com\CNCFiles' "$SAMBA_SMB_CONF"
+    grep -Fq '    msdfs proxy = \FILES.corp.example.com\Files,\SERVER.corp.example.com\Files' "$SAMBA_SMB_CONF"
     grep -Fq '[PF$]' "$SAMBA_SMB_CONF"
     grep -Fq '    msdfs proxy = \FILES.corp.example.com\PF$' "$SAMBA_SMB_CONF"
-    ! grep -Fq 'mal-dc2.corp.example.com' "$SAMBA_SMB_CONF"
+    ! grep -Fq 'dc2.corp.example.com' "$SAMBA_SMB_CONF"
     ! grep -Fq 'OLD.corp.example.com' "$SAMBA_SMB_CONF"
     [ "$(grep -Fc "$DFS_ROOT_PROXY_BEGIN" "$SAMBA_SMB_CONF")" -eq 1 ]
     grep -Fq 'smbcontrol all reload-config' "$CALL_LOG"
@@ -123,16 +123,16 @@ EOF
 
 @test "domain root sync converges idempotently and removes stale managed roots" {
     : > "$LDB_FIXTURE"
-    write_root_record CNCFiles ROOT_CNC
+    write_root_record Files ROOT_CNC
     write_root_record 'PF$' ROOT_PF
     _dfs_sync_domain_root_proxies
 
     : > "$LDB_FIXTURE"
-    write_root_record CNCFiles ROOT_CNC
+    write_root_record Files ROOT_CNC
     _dfs_sync_domain_root_proxies
 
     [ "$(grep -Fc "$DFS_ROOT_PROXY_BEGIN" "$SAMBA_SMB_CONF")" -eq 1 ]
-    [ "$(grep -Fc '[CNCFiles]' "$SAMBA_SMB_CONF")" -eq 1 ]
+    [ "$(grep -Fc '[Files]' "$SAMBA_SMB_CONF")" -eq 1 ]
     ! grep -Fq '[PF$]' "$SAMBA_SMB_CONF"
 }
 
