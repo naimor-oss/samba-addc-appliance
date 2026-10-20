@@ -16,7 +16,8 @@ SAMBA_UPD_SYNC_LOCK="${SAMBA_UPDATE_SYNC_LOCK:-/run/sysvol-sync.lock}"
 SAMBA_UPD_REQUIRED=(samba-sconfig sysvol-sync samba-dfs-parse-targets samba-addc-update)
 SAMBA_UPD_OPTIONAL=(samba-firstboot samba-init)
 SAMBA_UPD_MOTD=(15-samba-net-status)
-SAMBA_UPD_TIMERS=(samba-dfs-update.timer samba-dfs-root-proxy-sync.timer)
+SAMBA_UPD_TIMERS=(samba-dfs-update.timer samba-dfs-root-proxy-sync.timer samba-sysvol-sync.timer)
+SAMBA_UPD_UNITDIR="${SAMBA_UPDATE_UNITDIR:-/etc/systemd/system}"
 
 # A DC built before release identity has no marker of its own. It is
 # accepted as 0.0.0-legacy only when it is unmistakably a provisioned DC
@@ -30,8 +31,11 @@ update_detect_version() {
 
 update_backup_paths() {
     local s
+    # The SYSVOL timer units are listed so a rollback removes them when this
+    # update introduced them, and brings the old cron file back.
     printf '%s\n' "$SAMBA_UPD_ETC/smb.conf" "$SAMBA_UPD_ETC/dfs-update.conf" \
-        "$SAMBA_UPD_ETC/sysvol-sync.conf" "$SAMBA_UPD_LIBDIR" /etc/cron.d/sysvol-sync
+        "$SAMBA_UPD_ETC/sysvol-sync.conf" "$SAMBA_UPD_LIBDIR" /etc/cron.d/sysvol-sync \
+        "$SAMBA_UPD_UNITDIR/samba-sysvol-sync.service" "$SAMBA_UPD_UNITDIR/samba-sysvol-sync.timer"
     for s in "${SAMBA_UPD_REQUIRED[@]}" "${SAMBA_UPD_OPTIONAL[@]}"; do
         printf '%s\n' "$SAMBA_UPD_SBIN/$s"
     done
@@ -134,6 +138,11 @@ update_start() {
         SAMBA_UPD_SYNC_FD=""
     fi
     systemctl daemon-reload || return 1
+    # Re-assert the SYSVOL sync timer with the installed samba-sconfig: it
+    # replaces a legacy cron schedule (cron isn't in the image, so it may
+    # never have fired) and turns sync on for a DC that was never configured.
+    # Idempotent; keeps a stored interval.
+    "$SAMBA_UPD_SBIN/samba-sconfig" sysvol-sync-schedule || return 1
     while IFS= read -r t; do
         [[ -n "$t" ]] && { systemctl start "$t" || return 1; }
     done < <(cat "$SAMBA_UPD_RUN_STATE" 2>/dev/null)
