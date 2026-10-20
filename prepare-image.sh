@@ -752,7 +752,9 @@ NETBIOS_SELF=$(read_smbconf_param "netbios name")
 [[ -z "$NETBIOS_SELF" ]] && NETBIOS_SELF="$(hostname -s)"
 NETBIOS_SELF="${NETBIOS_SELF^^}"
 
-say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE"
+# A sync cycle logs its start only when it has work (gpo-plan, below), so a
+# short timer interval doesn't fill the log with idle cycles.
+[[ "$MODE" == "sync" ]] || say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE"
 
 # --- helpers ------------------------------------------------------------------
 ldb() { ldbsearch -H "$SAMDB" "$@" 2>/dev/null; }
@@ -869,8 +871,18 @@ gpo_stage_ready() {
     return 0
 }
 
+# True when DIR holds a GPT.INI under any of the casings GPO tools write.
+# read_local_gpt_version reports a missing file as version 0, which is also
+# the real version of a GPO that was created and never edited, so presence
+# has to be asked separately: a linked version-0 GPO without its folder
+# makes a client that uses this DC abandon its whole policy refresh.
+local_gpt_present() {
+    [[ -f "$1/GPT.INI" || -f "$1/gpt.ini" || -f "$1/Gpt.ini" ]]
+}
+
 # Validate a staged GPO tree before publication: GUID-shaped name, only
-# regular files and directories, a GPT.INI whose Version reaches MIN_VER.
+# regular files and directories, a GPT.INI whose Version reaches MIN_VER
+# (0 is a valid version for a GPO that was never edited).
 gpo_validate() {
     local dir="$1" guid="$2" min_ver="$3" odd ver
     [[ "$guid" =~ ^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$ ]] \
@@ -878,8 +890,9 @@ gpo_validate() {
     [[ -d "$dir" && ! -L "$dir" ]] || { say "GPO $guid: staged tree missing"; return 1; }
     odd=$(find "$dir" ! -type f ! -type d -print -quit 2>/dev/null)
     [[ -z "$odd" ]] || { say "GPO $guid: staged tree holds a link or special file; refusing"; return 1; }
+    local_gpt_present "$dir" || { say "GPO $guid: staged tree has no GPT.INI; refusing"; return 1; }
     ver=$(read_local_gpt_version "$dir")
-    [[ "$ver" =~ ^[0-9]+$ ]] && (( ver > 0 && ver >= min_ver )) \
+    [[ "$ver" =~ ^[0-9]+$ ]] && (( ver >= min_ver )) \
         || { say "GPO $guid: staged GPT.INI version ${ver:-?} < v$min_ver; refusing"; return 1; }
     return 0
 }
@@ -934,6 +947,37 @@ gpo_rollback() {
 }
 # --- END gpo-publish ----------------------------------------------------------
 
+# --- BEGIN gpo-plan -----------------------------------------------------------
+# What a cycle has to do, from the local SAM (target_versions) and the local
+# SYSVOL only. It runs before any network call, so a cycle with nothing to do
+# costs one local LDB query and a GPT.INI read per GPO: cheap enough for a
+# short timer, which lets the DC pick up a replicated GPO change on its next
+# tick instead of waiting for a long interval.
+#   PLAN_BEHIND   GPOs whose GPT.INI is missing (at any AD version, 0 too) or
+#                 older than AD, or unreadable as a number
+#   PLAN_ORPHANS  GUID-named folders with no GPO object in AD
+gpo_plan() {
+    local policies="$1" guid dir lv d bn
+    PLAN_BEHIND=()
+    PLAN_ORPHANS=()
+    for guid in "${!target_versions[@]}"; do
+        dir="$policies/$guid"
+        if local_gpt_present "$dir"; then
+            lv=$(read_local_gpt_version "$dir")
+            [[ "$lv" =~ ^[0-9]+$ ]] && (( lv >= target_versions[$guid] )) && continue
+        fi
+        PLAN_BEHIND+=("$guid")
+    done
+    for d in "$policies/"*/; do
+        [[ -d "$d" ]] || continue
+        bn=$(basename "$d")
+        [[ "$bn" =~ ^\{.*\}$ ]] || continue
+        [[ -z "${target_versions[$bn]+set}" ]] && PLAN_ORPHANS+=("$bn")
+    done
+    return 0
+}
+# --- END gpo-plan -------------------------------------------------------------
+
 probe_reachable() {
     timeout 2 bash -c "exec 9<>/dev/tcp/$1/445" >/dev/null 2>&1
 }
@@ -985,10 +1029,10 @@ if [[ "$MODE" == "--status" ]]; then
     for guid in "${!target_versions[@]}"; do
         target_ver="${target_versions[$guid]}"
         local_ver=$(read_local_gpt_version "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid")
-        if [[ "$local_ver" -ge "$target_ver" ]]; then
-            status="current"
-        elif [[ "$local_ver" -eq 0 ]]; then
+        if ! local_gpt_present "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid"; then
             status="MISSING"
+        elif [[ "$local_ver" -ge "$target_ver" ]]; then
+            status="current"
         else
             status="STALE (-$((target_ver - local_ver)))"
         fi
@@ -1006,6 +1050,13 @@ if [[ "$MODE" == "--status" ]]; then
     fi
     exit 0
 fi
+
+# --- fast path: nothing behind and no orphans means nothing to do -------------
+gpo_plan "$POLICIES_DIR"
+if (( ${#PLAN_BEHIND[@]} == 0 && ${#PLAN_ORPHANS[@]} == 0 )); then
+    exit 0
+fi
+say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE behind=${#PLAN_BEHIND[@]} orphans=${#PLAN_ORPHANS[@]}"
 
 # --- discover candidate peers (sync mode only) --------------------------------
 candidates_raw=()
@@ -1098,32 +1149,25 @@ gpo_stage_ready "$POLICIES_DIR" || fatal "SYSVOL staging area unavailable; nothi
 
 # Orphan cleanup: local GPO dirs with no matching AD object are detached with
 # one rename (kept in previous/ for --rollback), never deleted in place.
-for d in "$POLICIES_DIR/"*/; do
-    [[ -d "$d" ]] || continue
-    bn=$(basename "$d")
-    [[ "$bn" =~ ^\{.*\}$ ]] || continue
-    if [[ -z "${target_versions[$bn]+set}" ]]; then
-        if gpo_detach "$POLICIES_DIR" "$bn"; then
-            say "detached orphan: $bn (no AD object)"
-            delete_count=$((delete_count + 1))
-            any_pulled=1
-        else
-            say "orphan $bn: detach failed; left in place"
-            fail_count=$((fail_count + 1))
-        fi
+for bn in "${PLAN_ORPHANS[@]}"; do
+    if gpo_detach "$POLICIES_DIR" "$bn"; then
+        say "detached orphan: $bn (no AD object)"
+        delete_count=$((delete_count + 1))
+        any_pulled=1
+    else
+        say "orphan $bn: detach failed; left in place"
+        fail_count=$((fail_count + 1))
     fi
 done
 
-for guid in "${!target_versions[@]}"; do
+skip_count=$(( ${#target_versions[@]} - ${#PLAN_BEHIND[@]} ))
+for guid in "${PLAN_BEHIND[@]}"; do
     target_ver="${target_versions[$guid]}"
-    local_ver=$(read_local_gpt_version "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid")
+    local_ver=$(read_local_gpt_version "$POLICIES_DIR/$guid")
+    local_gpt_present "$POLICIES_DIR/$guid" || local_ver="missing"
+    local_lbl="v$local_ver"; [[ "$local_ver" == "missing" ]] && local_lbl="missing"
 
-    if [[ "$local_ver" -ge "$target_ver" ]]; then
-        skip_count=$((skip_count + 1))
-        continue
-    fi
-
-    say "GPO $guid: local v$local_ver < target v$target_ver"
+    say "GPO $guid: local $local_lbl < target v$target_ver"
 
     chosen_fqdn=""
     chosen_ver=""
@@ -1168,19 +1212,19 @@ for guid in "${!target_versions[@]}"; do
         && _gpo_fault after-download \
         && gpo_validate "$stage/$guid" "$guid" "$target_ver"; then
         if gpo_publish "$POLICIES_DIR" "$guid" "$stage/$guid"; then
-            say "GPO $guid: published v$local_ver -> v$chosen_ver from $chosen_fqdn"
-            if [[ "$local_ver" -eq 0 ]]; then
+            say "GPO $guid: published $local_lbl -> v$chosen_ver from $chosen_fqdn"
+            if [[ "$local_ver" == "missing" ]]; then
                 new_count=$((new_count + 1))
             else
                 update_count=$((update_count + 1))
             fi
             any_pulled=1
         else
-            say "GPO $guid: publication failed; v$local_ver stays live"
+            say "GPO $guid: publication failed; $local_lbl stays live"
             fail_count=$((fail_count + 1))
         fi
     else
-        say "GPO $guid: download from $chosen_fqdn incomplete or invalid; v$local_ver stays live"
+        say "GPO $guid: download from $chosen_fqdn incomplete or invalid; $local_lbl stays live"
         fail_count=$((fail_count + 1))
     fi
     cat "$mget_log" >>"$LOGFILE" 2>/dev/null
