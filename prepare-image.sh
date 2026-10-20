@@ -978,6 +978,57 @@ gpo_plan() {
 }
 # --- END gpo-plan -------------------------------------------------------------
 
+# One GPO folder's NT ACL from the GPO's AD security descriptor: the calls
+# `samba-tool ntacl sysvolreset` makes for each GPO (Samba 4.22,
+# python/samba/provision set_gpos_acl, with the passdb setup of
+# netcmd/ntacl.py cmd_ntacl_sysvolreset). It takes seconds where the
+# whole-tree reset walks every file in SYSVOL (20+ minutes on a field DC),
+# so a GPO is readable with its real ACL right after publication. Bounded by
+# a timeout: sysvolreset can spin on a missing idmap default, which the
+# full-reset worker repairs first; on any failure the caller falls back to
+# that full reset.
+gpo_set_acl() {
+    _gpo_fault set-acl || return 1
+    timeout 120 python3 - "$1" <<'PYACL'
+import re
+import sys
+
+import ldb
+from samba import provision
+from samba.auth import system_session
+from samba.dcerpc import security
+from samba.ndr import ndr_unpack
+from samba.ntacls import dsacl2fsacl
+from samba.param import LoadParm
+from samba.samba3 import param as s3param, passdb
+from samba.samdb import SamDB
+
+guid = sys.argv[1]
+if not re.fullmatch(r"\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}", guid):
+    sys.exit("not a GPO GUID: %s" % guid)
+lp = LoadParm()
+lp.load_default()
+samdb = SamDB(session_info=system_session(), lp=lp)
+use_ntvfs = "smb" in lp.get("server services")
+domain_sid = security.dom_sid(samdb.domain_sid)
+s3conf = s3param.get_context()
+s3conf.load(lp.configfile)
+s3conf.set("passdb backend", "samba_dsdb:%s" % samdb.url)
+passdb.reload_static_pdb()
+s4_passdb = passdb.PDB(s3conf.get("passdb backend"))
+res = samdb.search(base="CN=Policies,CN=System,%s" % samdb.domain_dn(),
+                   scope=ldb.SCOPE_ONELEVEL,
+                   expression="(cn=%s)" % ldb.binary_encode(guid),
+                   attrs=["cn", "nTSecurityDescriptor"])
+if len(res) != 1:
+    sys.exit("no GPO object for %s" % guid)
+acl = ndr_unpack(security.descriptor, res[0]["nTSecurityDescriptor"][0]).as_sddl()
+path = provision.getpolicypath(lp.get("path", "sysvol"), lp.get("realm").lower(), str(res[0]["cn"]))
+provision.set_dir_acl(path, dsacl2fsacl(acl, domain_sid), lp, str(domain_sid), use_ntvfs,
+                      passdb=s4_passdb)
+PYACL
+}
+
 probe_reachable() {
     timeout 2 bash -c "exec 9<>/dev/tcp/$1/445" >/dev/null 2>&1
 }
@@ -1015,9 +1066,14 @@ POLICIES_DIR="/var/lib/samba/sysvol/$REALM_LC/Policies"
 # --- --rollback mode: restore one retained generation --------------------------
 if [[ "$MODE" == "--rollback" ]]; then
     gpo_rollback "$POLICIES_DIR" "$ROLLBACK_GUID" || exit 1
-    flock -u 200
-    systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1 \
-        || { say "ERROR: SYSVOL NTACL reset failed after rollback"; exit 1; }
+    if gpo_set_acl "$ROLLBACK_GUID" >>"$LOGFILE" 2>&1; then
+        say "GPO $ROLLBACK_GUID: NTACL set from AD"
+    else
+        say "WARN: GPO $ROLLBACK_GUID: per-GPO NTACL failed; running the full reset"
+        flock -u 200
+        systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1 \
+            || { say "ERROR: SYSVOL NTACL reset failed after rollback"; exit 1; }
+    fi
     say "rollback of $ROLLBACK_GUID complete"
     exit 0
 fi
@@ -1142,8 +1198,8 @@ update_count=0
 delete_count=0
 skip_count=0
 no_source_count=0
-any_pulled=0
 fail_count=0
+acl_failed=0
 
 gpo_stage_ready "$POLICIES_DIR" || fatal "SYSVOL staging area unavailable; nothing published"
 
@@ -1153,7 +1209,6 @@ for bn in "${PLAN_ORPHANS[@]}"; do
     if gpo_detach "$POLICIES_DIR" "$bn"; then
         say "detached orphan: $bn (no AD object)"
         delete_count=$((delete_count + 1))
-        any_pulled=1
     else
         say "orphan $bn: detach failed; left in place"
         fail_count=$((fail_count + 1))
@@ -1213,12 +1268,17 @@ for guid in "${PLAN_BEHIND[@]}"; do
         && gpo_validate "$stage/$guid" "$guid" "$target_ver"; then
         if gpo_publish "$POLICIES_DIR" "$guid" "$stage/$guid"; then
             say "GPO $guid: published $local_lbl -> v$chosen_ver from $chosen_fqdn"
+            if gpo_set_acl "$guid" >>"$LOGFILE" 2>&1; then
+                say "GPO $guid: NTACL set from AD"
+            else
+                say "WARN: GPO $guid: per-GPO NTACL failed; the full reset will run"
+                acl_failed=1
+            fi
             if [[ "$local_ver" == "missing" ]]; then
                 new_count=$((new_count + 1))
             else
                 update_count=$((update_count + 1))
             fi
-            any_pulled=1
         else
             say "GPO $guid: publication failed; $local_lbl stays live"
             fail_count=$((fail_count + 1))
@@ -1231,10 +1291,11 @@ for guid in "${PLAN_BEHIND[@]}"; do
     rm -rf -- "$stage" "$mget_log"
 done
 
-# A single whole-tree reset at the end is cheaper than per-GPO walks and
-# matches what samba-tool exposes (no per-path scope). The systemd unit also
-# serializes resets and lets one finish if the cron client is interrupted.
-if [[ $any_pulled -eq 1 ]]; then
+# Each published GPO got its ACL above (gpo_set_acl). The whole-tree reset
+# runs only when that failed for some GPO: it repairs the idmap default first
+# and resets everything, at the cost of walking all of SYSVOL. The systemd
+# unit serializes resets and lets one finish if the client is interrupted.
+if [[ $acl_failed -eq 1 ]]; then
     say "starting durable SYSVOL NTACL reset"
     # The reset service takes this same lock. Release it before waiting for
     # systemd, otherwise the puller would wait on a service that is waiting on

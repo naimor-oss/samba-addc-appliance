@@ -4,6 +4,7 @@
 # local folders are orphans, and that a cycle with nothing to do has an empty
 # plan. A never-edited GPO (AD version 0) whose folder is missing must count
 # as behind: "0 >= 0" used to read as current, so such a GPO was never pulled.
+# shellcheck disable=SC2016  # the greps match the generated script's literal '$' text
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,12 +83,29 @@ echo "== the fast path in the generated script =="
 # The plan must run, and an empty plan must exit, before peer discovery: an
 # idle cycle makes no network call and writes no log line.
 gen=$(awk '/^cat > \/usr\/local\/sbin\/sysvol-sync << .SYNCEOF./{f=1;next} /^SYNCEOF$/{f=0} f' "$PREPARE")
-# shellcheck disable=SC2016  # the literal text of the generated line
 plan_at=$(grep -n '^gpo_plan "\$POLICIES_DIR"' <<<"$gen" | cut -d: -f1)
 peers_at=$(grep -n '^# --- discover candidate peers' <<<"$gen" | cut -d: -f1)
 start_at=$(grep -n '^say "start: .*behind=' <<<"$gen" | cut -d: -f1)
 check "the plan runs before peer discovery" yes "$([[ -n "$plan_at" && -n "$peers_at" && "$plan_at" -lt "$peers_at" ]] && echo yes || echo no)"
 check "a sync cycle logs its start only after the fast path" yes "$([[ -n "$start_at" && "$start_at" -gt "$plan_at" ]] && echo yes || echo no)"
+
+echo "== per-GPO NTACL =="
+# The ACL step itself needs a Samba DC (the lab scenario covers it). Here:
+# the embedded Python compiles, every publication is followed by it, and the
+# whole-tree reset runs only when it failed for some GPO.
+py=$(awk '/<<.PYACL.$/{f=1;next} /^PYACL$/{f=0} f' <<<"$gen")
+check "the per-GPO NTACL code is embedded" yes "$([[ -n "$py" ]] && echo yes || echo no)"
+if command -v python3 >/dev/null; then
+    printf '%s\n' "$py" > "$T/pyacl.py"
+    python3 -m py_compile "$T/pyacl.py" 2>/dev/null && r=compiles || r=broken
+    check "the per-GPO NTACL code compiles" compiles "$r"
+fi
+publish_at=$(grep -n 'if gpo_publish "\$POLICIES_DIR"' <<<"$gen" | cut -d: -f1)
+acl_at=$(grep -n 'if gpo_set_acl "\$guid"' <<<"$gen" | cut -d: -f1)
+check "each publication sets that GPO's NTACL" yes \
+    "$([[ -n "$publish_at" && -n "$acl_at" && "$acl_at" -gt "$publish_at" && "$acl_at" -lt $((publish_at + 4)) ]] && echo yes || echo no)"
+check "the whole-tree reset is only a fallback" 1 \
+    "$(grep -c '^if \[\[ \$acl_failed -eq 1 \]\]; then' <<<"$gen")"
 
 echo
 echo "summary: $PASS passed, $FAIL failed"
