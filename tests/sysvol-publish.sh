@@ -101,6 +101,13 @@ check "a non-GUID name is refused" refused "$r"
 rm -f "$T/bad/GPT.INI"
 gpo_validate "$T/bad" "$G" 1 && r=accepted || r=refused
 check "a tree without GPT.INI is refused" refused "$r"
+gpo_validate "$T/bad" "$G" 0 && r=accepted || r=refused
+check "a tree without GPT.INI is refused at version 0 too" refused "$r"
+gen "$T/v0/$G" 0
+gpo_validate "$T/v0/$G" "$G" 0 && r=accepted || r=refused
+check "a never-edited GPO (version 0) is accepted when AD says 0" accepted "$r"
+gpo_validate "$T/v0/$G" "$G" 1 && r=accepted || r=refused
+check "version 0 is refused when AD says 1" refused "$r"
 
 echo "== rollback =="
 gpo_rollback "$P" "$G"

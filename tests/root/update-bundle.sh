@@ -44,8 +44,10 @@ export PATH="$T/bin:$PATH"
 
 make_unit() {
     rm -rf /etc/samba /usr/local/lib/appliance-core /etc/samba-addc.release \
-        /var/backups/samba-addc-update /etc/update-motd.d /etc/cron.d/sysvol-sync
-    mkdir -p /etc/samba /usr/local/sbin /usr/local/lib/appliance-core /etc/update-motd.d /etc/cron.d
+        /var/backups/samba-addc-update /etc/update-motd.d /etc/cron.d/sysvol-sync \
+        /etc/systemd/system/samba-sysvol-sync.service /etc/systemd/system/samba-sysvol-sync.timer
+    mkdir -p /etc/samba /usr/local/sbin /usr/local/lib/appliance-core /etc/update-motd.d /etc/cron.d \
+        /etc/systemd/system
     printf '[global]\n    realm = LAB.EXAMPLE\n    server role = active directory domain controller\n' \
         > /etc/samba/smb.conf
     # Written by the old heredoc / sed writers.
@@ -72,7 +74,8 @@ snapshot() {
 }
 unit_unchanged() {
     sha256sum -c --quiet "$T/unit.before" >/dev/null 2>&1 \
-        && [[ ! -e /etc/samba-addc.release && ! -e /usr/local/sbin/samba-addc-update ]]
+        && [[ ! -e /etc/samba-addc.release && ! -e /usr/local/sbin/samba-addc-update ]] \
+        && [[ ! -e /etc/systemd/system/samba-sysvol-sync.timer && ! -e /etc/systemd/system/samba-sysvol-sync.service ]]
 }
 extract() {
     rm -rf "$T/x"; mkdir -p "$T/x"
@@ -98,6 +101,11 @@ grep -q 'stop samba-dfs-update.timer' /tmp/systemctl.log && grep -q 'start samba
 cmp -s /etc/samba/dfs-update.conf <(printf '# Managed by samba-sconfig dfs-* commands.\nDFS_ROOT="/srv/samba/dfs_root"\nDFS_SHARE="dfs_root"\nDFS_NAMESPACES="Public"\nDFS_PREFER=""\n') \
     || fail "the update changed DFS settings"
 pass "field DC 0.0.0-legacy -> $VERSION: scripts, libs, banner, updater, release file; settings untouched"
+[[ ! -e /etc/cron.d/sysvol-sync ]] || fail "the legacy cron schedule was left in place"
+grep -qx 'OnUnitActiveSec=15min' /etc/systemd/system/samba-sysvol-sync.timer \
+    || fail "the SYSVOL timer was not installed with the stored 15-minute interval"
+grep -q 'enable --now samba-sysvol-sync.timer' /tmp/systemctl.log || fail "the SYSVOL timer was not enabled"
+pass "the update replaces the cron schedule with the SYSVOL timer, keeping the interval"
 
 # ---- 2. built-in updater -------------------------------------------------------
 /usr/local/sbin/samba-addc-update status | grep -q "VERSION          $VERSION" || fail "status does not report $VERSION"
@@ -108,6 +116,15 @@ pass "samba-addc-update status and an idempotent re-apply"
 /usr/local/sbin/samba-addc-update rollback > "$T/out" 2>&1 || { cat "$T/out"; fail "rollback failed"; }
 unit_unchanged || fail "rollback did not restore the DC exactly"
 pass "samba-addc-update rollback restores every file and removes what the update added"
+
+# ---- 3b. a DC that never configured SYSVOL sync --------------------------------
+make_unit; extract
+rm -f /etc/samba/sysvol-sync.conf /etc/cron.d/sysvol-sync
+bash "$B/install.sh" > "$T/out" 2>&1 || { cat "$T/out"; fail "update of an unconfigured DC failed"; }
+grep -q 'OnUnitActiveSec=[0-9]*min' /etc/systemd/system/samba-sysvol-sync.timer \
+    || fail "an unconfigured DC did not get the SYSVOL timer"
+[[ ! -e /etc/samba/sysvol-sync.conf ]] || fail "the update wrote SYSVOL sync settings"
+pass "an unconfigured DC gets the SYSVOL timer at the default interval; no settings written"
 
 # ---- 4. refusals -------------------------------------------------------------------
 make_unit; extract

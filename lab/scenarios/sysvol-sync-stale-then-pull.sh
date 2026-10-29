@@ -50,7 +50,7 @@ run_scenario() {
         SC_ADMIN='$SC_ADMIN' \
         samba-sconfig join-dc"
 
-    step "configure sysvol-sync (15-min cron, default discovery)"
+    step "configure sysvol-sync (15-min interval, default discovery)"
     ssh_vm 'sudo bash -c "cat > /etc/samba/sysvol-sync.conf <<EOF
 SYNC_INTERVAL=\"15\"
 PREFERRED_DCS=\"\"

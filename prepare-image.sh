@@ -752,7 +752,9 @@ NETBIOS_SELF=$(read_smbconf_param "netbios name")
 [[ -z "$NETBIOS_SELF" ]] && NETBIOS_SELF="$(hostname -s)"
 NETBIOS_SELF="${NETBIOS_SELF^^}"
 
-say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE"
+# A sync cycle logs its start only when it has work (gpo-plan, below), so a
+# short timer interval doesn't fill the log with idle cycles.
+[[ "$MODE" == "sync" ]] || say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE"
 
 # --- helpers ------------------------------------------------------------------
 ldb() { ldbsearch -H "$SAMDB" "$@" 2>/dev/null; }
@@ -869,8 +871,18 @@ gpo_stage_ready() {
     return 0
 }
 
+# True when DIR holds a GPT.INI under any of the casings GPO tools write.
+# read_local_gpt_version reports a missing file as version 0, which is also
+# the real version of a GPO that was created and never edited, so presence
+# has to be asked separately: a linked version-0 GPO without its folder
+# makes a client that uses this DC abandon its whole policy refresh.
+local_gpt_present() {
+    [[ -f "$1/GPT.INI" || -f "$1/gpt.ini" || -f "$1/Gpt.ini" ]]
+}
+
 # Validate a staged GPO tree before publication: GUID-shaped name, only
-# regular files and directories, a GPT.INI whose Version reaches MIN_VER.
+# regular files and directories, a GPT.INI whose Version reaches MIN_VER
+# (0 is a valid version for a GPO that was never edited).
 gpo_validate() {
     local dir="$1" guid="$2" min_ver="$3" odd ver
     [[ "$guid" =~ ^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$ ]] \
@@ -878,8 +890,9 @@ gpo_validate() {
     [[ -d "$dir" && ! -L "$dir" ]] || { say "GPO $guid: staged tree missing"; return 1; }
     odd=$(find "$dir" ! -type f ! -type d -print -quit 2>/dev/null)
     [[ -z "$odd" ]] || { say "GPO $guid: staged tree holds a link or special file; refusing"; return 1; }
+    local_gpt_present "$dir" || { say "GPO $guid: staged tree has no GPT.INI; refusing"; return 1; }
     ver=$(read_local_gpt_version "$dir")
-    [[ "$ver" =~ ^[0-9]+$ ]] && (( ver > 0 && ver >= min_ver )) \
+    [[ "$ver" =~ ^[0-9]+$ ]] && (( ver >= min_ver )) \
         || { say "GPO $guid: staged GPT.INI version ${ver:-?} < v$min_ver; refusing"; return 1; }
     return 0
 }
@@ -934,6 +947,88 @@ gpo_rollback() {
 }
 # --- END gpo-publish ----------------------------------------------------------
 
+# --- BEGIN gpo-plan -----------------------------------------------------------
+# What a cycle has to do, from the local SAM (target_versions) and the local
+# SYSVOL only. It runs before any network call, so a cycle with nothing to do
+# costs one local LDB query and a GPT.INI read per GPO: cheap enough for a
+# short timer, which lets the DC pick up a replicated GPO change on its next
+# tick instead of waiting for a long interval.
+#   PLAN_BEHIND   GPOs whose GPT.INI is missing (at any AD version, 0 too) or
+#                 older than AD, or unreadable as a number
+#   PLAN_ORPHANS  GUID-named folders with no GPO object in AD
+gpo_plan() {
+    local policies="$1" guid dir lv d bn
+    PLAN_BEHIND=()
+    PLAN_ORPHANS=()
+    for guid in "${!target_versions[@]}"; do
+        dir="$policies/$guid"
+        if local_gpt_present "$dir"; then
+            lv=$(read_local_gpt_version "$dir")
+            [[ "$lv" =~ ^[0-9]+$ ]] && (( lv >= target_versions[$guid] )) && continue
+        fi
+        PLAN_BEHIND+=("$guid")
+    done
+    for d in "$policies/"*/; do
+        [[ -d "$d" ]] || continue
+        bn=$(basename "$d")
+        [[ "$bn" =~ ^\{.*\}$ ]] || continue
+        [[ -z "${target_versions[$bn]+set}" ]] && PLAN_ORPHANS+=("$bn")
+    done
+    return 0
+}
+# --- END gpo-plan -------------------------------------------------------------
+
+# One GPO folder's NT ACL from the GPO's AD security descriptor: the calls
+# `samba-tool ntacl sysvolreset` makes for each GPO (Samba 4.22,
+# python/samba/provision set_gpos_acl, with the passdb setup of
+# netcmd/ntacl.py cmd_ntacl_sysvolreset). It takes seconds where the
+# whole-tree reset walks every file in SYSVOL (20+ minutes on a field DC),
+# so a GPO is readable with its real ACL right after publication. Bounded by
+# a timeout: sysvolreset can spin on a missing idmap default, which the
+# full-reset worker repairs first; on any failure the caller falls back to
+# that full reset.
+gpo_set_acl() {
+    _gpo_fault set-acl || return 1
+    timeout 120 python3 - "$1" <<'PYACL'
+import re
+import sys
+
+import ldb
+from samba import provision
+from samba.auth import system_session
+from samba.dcerpc import security
+from samba.ndr import ndr_unpack
+from samba.ntacls import dsacl2fsacl
+from samba.param import LoadParm
+from samba.samba3 import param as s3param, passdb
+from samba.samdb import SamDB
+
+guid = sys.argv[1]
+if not re.fullmatch(r"\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}", guid):
+    sys.exit("not a GPO GUID: %s" % guid)
+lp = LoadParm()
+lp.load_default()
+samdb = SamDB(session_info=system_session(), lp=lp)
+use_ntvfs = "smb" in lp.get("server services")
+domain_sid = security.dom_sid(samdb.domain_sid)
+s3conf = s3param.get_context()
+s3conf.load(lp.configfile)
+s3conf.set("passdb backend", "samba_dsdb:%s" % samdb.url)
+passdb.reload_static_pdb()
+s4_passdb = passdb.PDB(s3conf.get("passdb backend"))
+res = samdb.search(base="CN=Policies,CN=System,%s" % samdb.domain_dn(),
+                   scope=ldb.SCOPE_ONELEVEL,
+                   expression="(cn=%s)" % ldb.binary_encode(guid),
+                   attrs=["cn", "nTSecurityDescriptor"])
+if len(res) != 1:
+    sys.exit("no GPO object for %s" % guid)
+acl = ndr_unpack(security.descriptor, res[0]["nTSecurityDescriptor"][0]).as_sddl()
+path = provision.getpolicypath(lp.get("path", "sysvol"), lp.get("realm").lower(), str(res[0]["cn"]))
+provision.set_dir_acl(path, dsacl2fsacl(acl, domain_sid), lp, str(domain_sid), use_ntvfs,
+                      passdb=s4_passdb)
+PYACL
+}
+
 probe_reachable() {
     timeout 2 bash -c "exec 9<>/dev/tcp/$1/445" >/dev/null 2>&1
 }
@@ -971,9 +1066,14 @@ POLICIES_DIR="/var/lib/samba/sysvol/$REALM_LC/Policies"
 # --- --rollback mode: restore one retained generation --------------------------
 if [[ "$MODE" == "--rollback" ]]; then
     gpo_rollback "$POLICIES_DIR" "$ROLLBACK_GUID" || exit 1
-    flock -u 200
-    systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1 \
-        || { say "ERROR: SYSVOL NTACL reset failed after rollback"; exit 1; }
+    if gpo_set_acl "$ROLLBACK_GUID" >>"$LOGFILE" 2>&1; then
+        say "GPO $ROLLBACK_GUID: NTACL set from AD"
+    else
+        say "WARN: GPO $ROLLBACK_GUID: per-GPO NTACL failed; running the full reset"
+        flock -u 200
+        systemctl start samba-sysvol-acl-reset.service >>"$LOGFILE" 2>&1 \
+            || { say "ERROR: SYSVOL NTACL reset failed after rollback"; exit 1; }
+    fi
     say "rollback of $ROLLBACK_GUID complete"
     exit 0
 fi
@@ -985,10 +1085,10 @@ if [[ "$MODE" == "--status" ]]; then
     for guid in "${!target_versions[@]}"; do
         target_ver="${target_versions[$guid]}"
         local_ver=$(read_local_gpt_version "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid")
-        if [[ "$local_ver" -ge "$target_ver" ]]; then
-            status="current"
-        elif [[ "$local_ver" -eq 0 ]]; then
+        if ! local_gpt_present "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid"; then
             status="MISSING"
+        elif [[ "$local_ver" -ge "$target_ver" ]]; then
+            status="current"
         else
             status="STALE (-$((target_ver - local_ver)))"
         fi
@@ -1006,6 +1106,13 @@ if [[ "$MODE" == "--status" ]]; then
     fi
     exit 0
 fi
+
+# --- fast path: nothing behind and no orphans means nothing to do -------------
+gpo_plan "$POLICIES_DIR"
+if (( ${#PLAN_BEHIND[@]} == 0 && ${#PLAN_ORPHANS[@]} == 0 )); then
+    exit 0
+fi
+say "start: realm=$REALM self=$NETBIOS_SELF mode=$MODE behind=${#PLAN_BEHIND[@]} orphans=${#PLAN_ORPHANS[@]}"
 
 # --- discover candidate peers (sync mode only) --------------------------------
 candidates_raw=()
@@ -1091,39 +1198,31 @@ update_count=0
 delete_count=0
 skip_count=0
 no_source_count=0
-any_pulled=0
 fail_count=0
+acl_failed=0
 
 gpo_stage_ready "$POLICIES_DIR" || fatal "SYSVOL staging area unavailable; nothing published"
 
 # Orphan cleanup: local GPO dirs with no matching AD object are detached with
 # one rename (kept in previous/ for --rollback), never deleted in place.
-for d in "$POLICIES_DIR/"*/; do
-    [[ -d "$d" ]] || continue
-    bn=$(basename "$d")
-    [[ "$bn" =~ ^\{.*\}$ ]] || continue
-    if [[ -z "${target_versions[$bn]+set}" ]]; then
-        if gpo_detach "$POLICIES_DIR" "$bn"; then
-            say "detached orphan: $bn (no AD object)"
-            delete_count=$((delete_count + 1))
-            any_pulled=1
-        else
-            say "orphan $bn: detach failed; left in place"
-            fail_count=$((fail_count + 1))
-        fi
+for bn in "${PLAN_ORPHANS[@]}"; do
+    if gpo_detach "$POLICIES_DIR" "$bn"; then
+        say "detached orphan: $bn (no AD object)"
+        delete_count=$((delete_count + 1))
+    else
+        say "orphan $bn: detach failed; left in place"
+        fail_count=$((fail_count + 1))
     fi
 done
 
-for guid in "${!target_versions[@]}"; do
+skip_count=$(( ${#target_versions[@]} - ${#PLAN_BEHIND[@]} ))
+for guid in "${PLAN_BEHIND[@]}"; do
     target_ver="${target_versions[$guid]}"
-    local_ver=$(read_local_gpt_version "/var/lib/samba/sysvol/$REALM_LC/Policies/$guid")
+    local_ver=$(read_local_gpt_version "$POLICIES_DIR/$guid")
+    local_gpt_present "$POLICIES_DIR/$guid" || local_ver="missing"
+    local_lbl="v$local_ver"; [[ "$local_ver" == "missing" ]] && local_lbl="missing"
 
-    if [[ "$local_ver" -ge "$target_ver" ]]; then
-        skip_count=$((skip_count + 1))
-        continue
-    fi
-
-    say "GPO $guid: local v$local_ver < target v$target_ver"
+    say "GPO $guid: local $local_lbl < target v$target_ver"
 
     chosen_fqdn=""
     chosen_ver=""
@@ -1168,29 +1267,35 @@ for guid in "${!target_versions[@]}"; do
         && _gpo_fault after-download \
         && gpo_validate "$stage/$guid" "$guid" "$target_ver"; then
         if gpo_publish "$POLICIES_DIR" "$guid" "$stage/$guid"; then
-            say "GPO $guid: published v$local_ver -> v$chosen_ver from $chosen_fqdn"
-            if [[ "$local_ver" -eq 0 ]]; then
+            say "GPO $guid: published $local_lbl -> v$chosen_ver from $chosen_fqdn"
+            if gpo_set_acl "$guid" >>"$LOGFILE" 2>&1; then
+                say "GPO $guid: NTACL set from AD"
+            else
+                say "WARN: GPO $guid: per-GPO NTACL failed; the full reset will run"
+                acl_failed=1
+            fi
+            if [[ "$local_ver" == "missing" ]]; then
                 new_count=$((new_count + 1))
             else
                 update_count=$((update_count + 1))
             fi
-            any_pulled=1
         else
-            say "GPO $guid: publication failed; v$local_ver stays live"
+            say "GPO $guid: publication failed; $local_lbl stays live"
             fail_count=$((fail_count + 1))
         fi
     else
-        say "GPO $guid: download from $chosen_fqdn incomplete or invalid; v$local_ver stays live"
+        say "GPO $guid: download from $chosen_fqdn incomplete or invalid; $local_lbl stays live"
         fail_count=$((fail_count + 1))
     fi
     cat "$mget_log" >>"$LOGFILE" 2>/dev/null
     rm -rf -- "$stage" "$mget_log"
 done
 
-# A single whole-tree reset at the end is cheaper than per-GPO walks and
-# matches what samba-tool exposes (no per-path scope). The systemd unit also
-# serializes resets and lets one finish if the cron client is interrupted.
-if [[ $any_pulled -eq 1 ]]; then
+# Each published GPO got its ACL above (gpo_set_acl). The whole-tree reset
+# runs only when that failed for some GPO: it repairs the idmap default first
+# and resets everything, at the cost of walking all of SYSVOL. The systemd
+# unit serializes resets and lets one finish if the client is interrupted.
+if [[ $acl_failed -eq 1 ]]; then
     say "starting durable SYSVOL NTACL reset"
     # The reset service takes this same lock. Release it before waiting for
     # systemd, otherwise the puller would wait on a service that is waiting on

@@ -25,8 +25,14 @@ so a bundle and an image built from the same commit install the same files.
 - Installs `samba-addc-update` and writes `/etc/samba-addc.release`.
 - Never touches the AD database (`/var/lib/samba`), the DC's settings
   files, or Debian packages (Samba security updates arrive through apt).
-- Pauses the DFS timers and waits for a running `sysvol-sync` while files
-  are replaced, then restores them.
+- Pauses the DFS and SYSVOL timers and waits for a running `sysvol-sync`
+  while files are replaced, then restores them.
+- Turns on the SYSVOL sync timer (`samba-sconfig sysvol-sync-schedule`):
+  it replaces a legacy `/etc/cron.d/sysvol-sync` (the image has no cron,
+  so that schedule may never have run) and enables sync on a DC that was
+  never configured, at the default interval. A stored interval is kept;
+  the settings file is not written. A rollback removes the timer units
+  the update added and restores the cron file.
 
 ## Recognising a DC built before release identity
 

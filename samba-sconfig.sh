@@ -1278,6 +1278,8 @@ Check the full log: $prov_log"
     if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
         dfs_ok=0
     fi
+    sysvol_sync_schedule >/dev/null 2>&1 \
+        || info "SYSVOL sync could not be scheduled, so later GPO edits won't reach this DC.\nRetry: samba-sconfig sysvol-sync-schedule"
 
     if is_addc_running; then
         if (( dfs_ok )); then
@@ -1342,11 +1344,16 @@ domain_join_dc() {
         if ! dfs_out=$(configure_domain_dfs_root_proxies 2>&1); then
             dfs_rc=1
         fi
-        # Keep the service-owned, potentially long ACL reset last. If the SSH
-        # client disappears while monitoring it, every other post-join step is
-        # already complete and systemd finishes the reset independently.
+        # Keep the service-owned, potentially long ACL reset (inside the seed)
+        # last but for the quick timer install after it. If the SSH client
+        # disappears while monitoring the reset, the other post-join steps are
+        # complete and systemd finishes the reset independently; only the timer
+        # is then missing, and the next update bundle installs it.
         local sysvol_rc=0
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        # After the seed: it copies into the live SYSVOL without the puller's lock.
+        sysvol_sync_schedule >/dev/null 2>&1 \
+            || info "SYSVOL sync could not be scheduled, so later GPO edits won't reach this DC.\nRetry: samba-sconfig sysvol-sync-schedule"
         _tui_report_join_outcome "additional DC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "Join FAILED.\n\nCheck connectivity to $existing_dc ($dc_ip) and credentials."
@@ -1398,6 +1405,8 @@ domain_join_rodc() {
         fi
         local sysvol_rc=0
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        sysvol_sync_schedule >/dev/null 2>&1 \
+            || info "SYSVOL sync could not be scheduled, so later GPO edits won't reach this DC.\nRetry: samba-sconfig sysvol-sync-schedule"
         _tui_report_join_outcome "RODC" "$fl_str" "$DC_REALM" "$sysvol_rc" "$dfs_rc" "$dfs_out"
     else
         info "RODC join FAILED."
@@ -1578,7 +1587,13 @@ reset_admin_password() {
 # 4. SYSVOL REPLICATION
 #===============================================================================
 SYSVOL_SYNC_CONF="${SAMBA_SYSVOL_SYNC_CONF:-/etc/samba/sysvol-sync.conf}"
-SYSVOL_SYNC_CRON="/etc/cron.d/sysvol-sync"
+# Legacy schedule: the timer install removes it (see _install_sysvol_sync_timer).
+SYSVOL_SYNC_CRON="${SAMBA_SYSVOL_SYNC_CRON:-/etc/cron.d/sysvol-sync}"
+readonly SYSVOL_SYNC_SERVICE="samba-sysvol-sync.service"
+readonly SYSVOL_SYNC_TIMER="samba-sysvol-sync.timer"
+readonly SYSVOL_SYNC_SERVICE_FILE="${SAMBA_SYSVOL_SYNC_SERVICE_FILE:-/etc/systemd/system/${SYSVOL_SYNC_SERVICE}}"
+readonly SYSVOL_SYNC_TIMER_FILE="${SAMBA_SYSVOL_SYNC_TIMER_FILE:-/etc/systemd/system/${SYSVOL_SYNC_TIMER}}"
+readonly SYSVOL_SYNC_DEFAULT_INTERVAL=2
 SYSVOL_SYNC_OLD_CRED="/etc/samba/sysvol-sync.cred"
 readonly -a SYSVOL_SYNC_KEYS=(SYNC_INTERVAL PREFERRED_DCS EXCLUDE_DCS)
 # Space-separated host names (PREFERRED_DCS / EXCLUDE_DCS).
@@ -1633,15 +1648,92 @@ _migrate_old_sysvol_conf() {
     rm -f "$SYSVOL_SYNC_CONF"
 }
 
+# The puller runs from a systemd timer, not /etc/cron.d: the image doesn't
+# install cron, so a configured cron schedule could silently never fire
+# (seen in the field: one run at configure time, then none for months). A
+# timer also takes any interval, where cron's */N fires evenly only when N
+# divides 60. sysvol-sync decides from local data whether anything is behind
+# before any network call, so a short interval costs little when idle.
+_install_sysvol_sync_timer() {
+    local interval="$1"
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || (( interval < 1 || interval > 59 )); then
+        echo "[sysvol] interval must be 1-59 minutes, got: $interval" >&2
+        return 1
+    fi
+    install -d -m 0755 "$(dirname "$SYSVOL_SYNC_SERVICE_FILE")" || return 1
+    # TimeoutStartSec matches the NTACL reset unit: a cycle waits for the
+    # whole-tree reset when its per-GPO ACL step fails.
+    cat > "$SYSVOL_SYNC_SERVICE_FILE" <<'UNITEOF'
+[Unit]
+Description=Pull SYSVOL changes from peer domain controllers
+After=samba-ad-dc.service
+Requires=samba-ad-dc.service
+ConditionPathExists=/etc/samba/smb.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sysvol-sync
+TimeoutStartSec=2h
+UNITEOF
+    cat > "$SYSVOL_SYNC_TIMER_FILE" <<TIMEREOF
+[Unit]
+Description=Periodic SYSVOL pull from peer domain controllers
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}min
+RandomizedDelaySec=15s
+Unit=${SYSVOL_SYNC_SERVICE}
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+    chmod 0644 "$SYSVOL_SYNC_SERVICE_FILE" "$SYSVOL_SYNC_TIMER_FILE"
+    rm -f "$SYSVOL_SYNC_CRON"
+    systemctl daemon-reload || return 1
+    systemctl enable --now "$SYSVOL_SYNC_TIMER"
+}
+
+# Store the sync settings after checking them. Echoes the reason and
+# returns 1 when a value is unusable; nothing is written then.
+_sysvol_sync_save() {
+    local interval="$1" preferred="$2" excluded="$3"
+    if ! [[ "$interval" =~ ^[0-9]+$ ]] || (( interval < 1 || interval > 59 )); then
+        echo "Interval must be a whole number of minutes between 1 and 59."
+        return 1
+    fi
+    if ! [[ "$preferred" =~ $FQDN_LIST_RE && "$excluded" =~ $FQDN_LIST_RE ]]; then
+        echo "Host lists must be space-separated host names (letters, digits, dots, dashes)."
+        return 1
+    fi
+    appcore_kv_write "$SYSVOL_SYNC_CONF" 0640 \
+        SYNC_INTERVAL "$interval" PREFERRED_DCS "$preferred" EXCLUDE_DCS "$excluded" \
+        || { echo "Could not write $SYSVOL_SYNC_CONF."; return 1; }
+}
+
+# Turn the puller on: the stored interval, or the default on a DC that was
+# never configured. Join, provision and every update bundle call it, because
+# a DC nobody configured used to keep its join-time SYSVOL forever. It never
+# writes the settings file (sysvol-sync treats it as optional, and a bundle
+# leaves settings alone). Idempotent.
+sysvol_sync_schedule() {
+    local SYNC_INTERVAL="" PREFERRED_DCS="" EXCLUDE_DCS=""
+    if [[ -f "$SYSVOL_SYNC_CONF" ]]; then
+        appcore_kv_load "$SYSVOL_SYNC_CONF" "${SYSVOL_SYNC_KEYS[@]}" || {
+            echo "[sysvol] $SYSVOL_SYNC_CONF is malformed; run: samba-sconfig sysvol-sync-configure" >&2
+            return 1
+        }
+    fi
+    _install_sysvol_sync_timer "${SYNC_INTERVAL:-$SYSVOL_SYNC_DEFAULT_INTERVAL}"
+}
+
 configure_sysvol_sync() {
     _migrate_old_sysvol_conf
 
     local interval
     interval=$(whiptail --inputbox \
-        "Sync interval (minutes, 1-59).\n\n15 is a good default: cheap when nothing changed, responsive enough\nfor production GPO edits, low log churn." \
-        13 68 "15" 3>&1 1>&2 2>&3) || return
-    [[ "$interval" =~ ^[0-9]+$ ]] || { info "Interval must be a positive integer."; return; }
-    (( interval >= 1 && interval <= 59 )) || { info "Interval must be between 1 and 59 minutes."; return; }
+        "Sync interval (minutes, 1-59).\n\n${SYSVOL_SYNC_DEFAULT_INTERVAL} is a good default: an idle cycle is one local query with no\nnetwork traffic or log line, and a GPO edit arrives within minutes." \
+        13 72 "$SYSVOL_SYNC_DEFAULT_INTERVAL" 3>&1 1>&2 2>&3) || return
 
     local preferred excluded
     preferred=$(whiptail --inputbox \
@@ -1652,8 +1744,6 @@ configure_sysvol_sync() {
         13 72 "" 3>&1 1>&2 2>&3) || return
     preferred=$(printf '%s' "$preferred" | tr -s ' ' | sed 's/^ //; s/ $//')
     excluded=$(printf '%s' "$excluded" | tr -s ' ' | sed 's/^ //; s/ $//')
-    [[ "$preferred" =~ $FQDN_LIST_RE && "$excluded" =~ $FQDN_LIST_RE ]] \
-        || { info "Host lists must be space-separated host names (letters, digits, dots, dashes)."; return; }
 
     if [[ ! -f /var/lib/samba/private/secrets.tdb ]]; then
         info "DC not joined / provisioned (no secrets.tdb). Configure aborted."
@@ -1661,23 +1751,17 @@ configure_sysvol_sync() {
     fi
 
     # sysvol-sync.conf v2 (multi-source, machine credentials), written as data.
-    if ! appcore_kv_write "$SYSVOL_SYNC_CONF" 0640 \
-            SYNC_INTERVAL "$interval" PREFERRED_DCS "$preferred" EXCLUDE_DCS "$excluded"; then
-        info "Could not write $SYSVOL_SYNC_CONF."
+    local why
+    why=$(_sysvol_sync_save "$interval" "$preferred" "$excluded") || { info "$why"; return; }
+    if ! _install_sysvol_sync_timer "$interval" >/dev/null 2>&1; then
+        info "Settings saved, but the $SYSVOL_SYNC_TIMER timer could not be enabled. Check: systemctl status $SYSVOL_SYNC_TIMER"
         return
     fi
-
-    cat > "$SYSVOL_SYNC_CRON" <<CRON
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/${interval} * * * * root /usr/local/sbin/sysvol-sync
-CRON
-    chmod 644 "$SYSVOL_SYNC_CRON"
 
     info "Configured.\nInterval: ${interval} min | Preferred: ${preferred:-<none>} | Excluded: ${excluded:-<none>}\n\nNext: 'Run Sync Now' (menu 2) to do an immediate cycle, then\n'Show SYSVOL Freshness' (menu 3) to confirm GPOs converged."
 }
 
 run_sysvol_sync() {
-    [[ -f "$SYSVOL_SYNC_CONF" ]] || { info "Not configured. Run Configure (menu 1) first."; return; }
     yesno "Run SYSVOL sync now?" || return
     whiptail --infobox "Syncing..." 6 40
     local output rc
@@ -1762,6 +1846,40 @@ _sysvol_acl_worker_body() {
 # Internal worker invoked by samba-sysvol-acl-reset.service. tee keeps a
 # durable operator log while the service's stdout remains available in the
 # journal. The pipeline status is the worker status, never tee's status.
+# Headless SYSVOL sync. configure takes SC_SYSVOL_INTERVAL (minutes,
+# default SYSVOL_SYNC_DEFAULT_INTERVAL), SC_SYSVOL_PREFERRED and
+# SC_SYSVOL_EXCLUDED (space-separated host names, default empty).
+cli_sysvol_sync_configure() {
+    local interval="${SC_SYSVOL_INTERVAL:-$SYSVOL_SYNC_DEFAULT_INTERVAL}" why
+    [[ -f /var/lib/samba/private/secrets.tdb ]] \
+        || { echo "[sysvol] DC not joined or provisioned (no secrets.tdb)" >&2; return 1; }
+    why=$(_sysvol_sync_save "$interval" "${SC_SYSVOL_PREFERRED:-}" "${SC_SYSVOL_EXCLUDED:-}") \
+        || { echo "[sysvol] $why" >&2; return 2; }
+    _install_sysvol_sync_timer "$interval" || return 1
+    echo "[sysvol] sync every ${interval} min (${SYSVOL_SYNC_TIMER})"
+}
+
+# One cycle now, for right after a GPO edit; the log tail shows what it did.
+cli_sysvol_sync_run() {
+    local rc=0
+    /usr/local/sbin/sysvol-sync || rc=$?
+    tail -5 /var/log/samba/sysvol-sync.log 2>/dev/null
+    return "$rc"
+}
+
+# Freshness table plus the timer's state. Exits 1 when any GPO is MISSING or
+# STALE, or the timer isn't active, so a monitor can alert on it.
+cli_sysvol_sync_status() {
+    local table timer rc=0
+    table=$(/usr/local/sbin/sysvol-sync --status 2>&1) || rc=1
+    printf '%s\n' "$table"
+    timer=$(systemctl is-active "$SYSVOL_SYNC_TIMER" 2>/dev/null || true)
+    printf '\ntimer %s: %s\n' "$SYSVOL_SYNC_TIMER" "${timer:-unknown}"
+    [[ "$timer" == active ]] || rc=1
+    grep -Eq '[[:space:]](MISSING|STALE)' <<<"$table" && rc=1
+    return "$rc"
+}
+
 cli_sysvol_acl_worker() {
     install -d -m 0750 "$(dirname "$SYSVOL_ACL_RESET_LOG")"
     touch "$SYSVOL_ACL_RESET_LOG"
@@ -1919,17 +2037,15 @@ Excluded:   ${EXCLUDE_DCS:-<none>}
 
 "
     else
-        st+="Not configured.
+        st+="Default settings (no $SYSVOL_SYNC_CONF): every ${SYSVOL_SYNC_DEFAULT_INTERVAL} min, any reachable DC.
 
 "
     fi
-    if [[ -f "$SYSVOL_SYNC_CRON" ]]; then
-        st+="Cron:
-$(cat "$SYSVOL_SYNC_CRON")
+    st+="Timer ${SYSVOL_SYNC_TIMER}: $(systemctl is-enabled "$SYSVOL_SYNC_TIMER" 2>/dev/null || echo not-installed), $(systemctl is-active "$SYSVOL_SYNC_TIMER" 2>/dev/null || echo inactive)
 
 "
-    else
-        st+="Cron: not installed
+    if [[ -f "$SYSVOL_SYNC_CRON" ]]; then
+        st+="Legacy cron file still present ($SYSVOL_SYNC_CRON); Configure replaces it with the timer.
 
 "
     fi
@@ -3606,6 +3722,9 @@ cli_join_dc() {
         local sysvol_rc=0 dfs_rc=0
         configure_domain_dfs_root_proxies || dfs_rc=$?
         seed_sysvol "$dc_ip" "$DC_NETBIOS" "$DC_ADMIN_USER" "$DC_ADMIN_PASS" "$DC_REALM" || sysvol_rc=$?
+        # After the seed: it copies into the live SYSVOL without the puller's lock.
+        sysvol_sync_schedule \
+            || echo "[sconfig] WARN: SYSVOL sync not scheduled; retry: sudo samba-sconfig sysvol-sync-schedule" >&2
         _cli_report_join_outcome "$fl_str" "$sysvol_rc" "$dfs_rc"
     else
         local rc=$?
@@ -3637,6 +3756,8 @@ cli_provision_new() {
         apply_hardening_to_smb_conf
         post_provision_setup "$DC_REALM" "$DC_DNS_FORWARDER"
         _generate_tls_cert_core
+        sysvol_sync_schedule \
+            || echo "[sconfig] WARN: SYSVOL sync not scheduled; retry: sudo samba-sconfig sysvol-sync-schedule" >&2
         if configure_domain_dfs_root_proxies; then
             echo "[sconfig] PROVISION SUCCESS (realm=$DC_REALM, netbios=$DC_NETBIOS)"
         else
@@ -3840,6 +3961,14 @@ Usage: samba-sconfig                       # interactive TUI
            required env: SC_REALM, SC_NETBIOS, SC_PASS
            optional env: SC_FWD (default: 1.1.1.1)
 
+SYSVOL sync (pulls GPO files from peer DCs; enabled by join and provision):
+       samba-sconfig sysvol-sync-configure # store settings, (re)install the timer
+           optional env: SC_SYSVOL_INTERVAL (minutes, default: ${SYSVOL_SYNC_DEFAULT_INTERVAL})
+                         SC_SYSVOL_PREFERRED, SC_SYSVOL_EXCLUDED (host names)
+       samba-sconfig sysvol-sync-schedule  # enable the timer with stored settings
+       samba-sconfig sysvol-sync-run       # one cycle now (e.g. after a GPO edit)
+       samba-sconfig sysvol-sync-status    # freshness table; exit 1 if behind
+
 SYSVOL ACL maintenance:
        samba-sconfig sysvol-acl-reset      # durable reset with elapsed progress
        samba-sconfig sysvol-acl-status     # reconnectable service status + log
@@ -3880,6 +4009,10 @@ case "${1:-}" in
     probe-fl)       shift; cli_probe_fl "$@" ;;
     join-dc)        cli_join_dc ;;
     provision-new)  cli_provision_new ;;
+    sysvol-sync-configure) cli_sysvol_sync_configure ;;
+    sysvol-sync-schedule)  sysvol_sync_schedule ;;
+    sysvol-sync-run)       cli_sysvol_sync_run ;;
+    sysvol-sync-status)    cli_sysvol_sync_status ;;
     sysvol-acl-reset)   run_sysvol_acl_reset ;;
     sysvol-acl-status)  cli_sysvol_acl_status ;;
     sysvol-acl-install) _install_sysvol_acl_reset_unit ;;
