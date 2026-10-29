@@ -117,9 +117,8 @@ lab/run-scenario.sh join-dc --verify-only
 ```bash
 bash -n prepare-image.sh samba-sconfig.sh lab/run-scenario.sh lab/scenarios/*.sh
 bash tests/sysvol-publish.sh
-# root-only, in a throwaway container (CI runs it):
-docker run --rm -v "$PWD/..":/ws:ro -e DISPOSABLE_ROOT_TEST=1 \
-    debian:trixie bash /ws/samba-addc-appliance/tests/root/update-bundle.sh
+# root-only, in throwaway containers (needs Docker; GitHub doesn't run it):
+../dev-commons/bin/root-tests.sh samba-addc-appliance
 ```
 
 ## Development Rules
